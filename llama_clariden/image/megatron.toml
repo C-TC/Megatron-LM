@@ -1,0 +1,19 @@
+image = "/iopsstor/scratch/cscs/ctianche/playground/Megatron-LM/clariden/megatron.sqsh"
+mounts = [  "/iopsstor/scratch/cscs:/iopsstor/scratch/cscs",
+            "/users/ctianche/.cache:/users/ctianche/.cache",
+            "/etc/slurm:/etc/slurm",
+            "/opt/cscs/aws-ofi-ccl-plugin/cuda12/libnccl-net.so:/usr/lib/libnccl-net-ofi.so",
+]
+
+workdir = "/iopsstor/scratch/cscs/ctianche/playground"
+writable=true
+
+
+
+[env]
+NCCL_DEBUG = "WARN"
+
+# Enable the aws-ofi-nccl hook to use slingshot
+[annotations]
+com.hooks.aws_ofi_nccl.enabled = "true"
+com.hooks.aws_ofi_nccl.variant = "cuda12"
