@@ -801,6 +801,7 @@ class ParallelAttention(MegatronModule):
         else:
             q, k, v = [rearrange(x, 's b ... -> b s ...').contiguous()
                        for x in (query_layer, key_layer, value_layer)]
+            # Tiancheng: Look, no checkpointing for flash attention. Actually no need for it.
             if not self.sequence_parallel:
                 with tensor_parallel.get_cuda_rng_tracker().fork():
                     context_layer = self.core_attention_flash(q, k, v)
@@ -882,6 +883,7 @@ class ParallelTransformerLayer(MegatronModule):
             attn_mask_type=self_attn_mask_type)
         self.hidden_dropout = config.hidden_dropout
         self.bias_dropout_fusion = config.bias_dropout_fusion
+        # Tiancheng: TODO: what is droppath? seems never used.
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
 
         # Normalize the attention output
@@ -900,6 +902,7 @@ class ParallelTransformerLayer(MegatronModule):
             self.post_inter_attention_norm = get_norm(config)
 
         # MLP
+        # Tiancheng: TODO: MLP support in megatron.
         if args.num_experts is not None:
             self.mlp = SwitchMLP(config)
         else:
@@ -1180,6 +1183,7 @@ class ParallelTransformerLayer(MegatronModule):
             # dropout semantics during training and inference phases.
             if self.bias_dropout_fusion:
                 if self.training:
+                    # Tiancheng: TorchDynamo jitted fused kernel.
                     bias_dropout_add_func = bias_dropout_add_fused_train
                 else:
                     bias_dropout_add_func = bias_dropout_add_fused_inference
@@ -1485,6 +1489,7 @@ class ParallelTransformer(MegatronModule):
                 current_layer_type = _get_layer_type(
                     model_type, layer_type, self.retro_layer_numbers,
                     layer_number)
+                # Tiancheng: Layer definition. TODO: What is drop_path_rates?
                 return ParallelTransformerLayer(
                     config,
                     layer_number,

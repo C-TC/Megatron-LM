@@ -33,6 +33,7 @@ def post_language_model_processing(lm_output, labels, logit_weights,
             assert output.dtype == torch.half
             loss = tensor_parallel.vocab_parallel_cross_entropy(output, labels)
         else:
+            # Tiancheng: As its name, vocab parallel just as the input embedding stage.
             loss = tensor_parallel.vocab_parallel_cross_entropy(output.float(), labels)
         
         # [s b] => [b, s]

@@ -209,6 +209,9 @@ class VocabParallelEmbedding(torch.nn.Module):
                 _initialize_affine_weight_gpu(self.weight, init_method, partition_dim=0, stride=1)
 
     def forward(self, input_):
+        # Tiancheng: VocabParallelEmbedding maps token ids to hidden_dim sized vectors.
+        # Each TP rank handles a portion of the vocabulary, set 0 to the rest. Perform
+        # Allgather to get the full embedding matrix.
         if self.tensor_model_parallel_size > 1:
             # Build the mask.
             input_mask = (input_ < self.vocab_start_index) | (input_ >= self.vocab_end_index)
@@ -335,6 +338,7 @@ def linear_with_frozen_weight(
 
 class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
     """See linear_with_grad_accumulation_and_async_allreduce"""
+    # Tiancheng: TODO: depict execution of fw/bw of SP with no async TP AR, and Async TP AR with no SP.
 
     @staticmethod
     @custom_fwd
@@ -360,6 +364,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             dim_size = list(input.size())
             dim_size[0] = dim_size[0] * world_size
 
+            # Tiancheng: TODO: Global memory buffer.
             all_gather_buffer = get_global_memory_buffer().get_tensor(dim_size, input.dtype, "mpu")
             torch.distributed._all_gather_base(
                 all_gather_buffer, input, group=get_tensor_model_parallel_group()
@@ -370,6 +375,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
 
         output = torch.matmul(total_input, weight.t())
         if bias is not None:
+            # Tiancheng: Not fused?
             output = output + bias
         return output
 
@@ -494,6 +500,8 @@ def linear_with_grad_accumulation_and_async_allreduce(
     sequence_parallel: bool,
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
+    # Tiancheng: Important notes. Answers why grad accum fusion, TP AR async.
+    # And CUDA_DEVICE_MAX_CONNECTIONS=1.
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
 
@@ -723,6 +731,7 @@ class ColumnParallelLinear(torch.nn.Module):
             self.sequence_parallel = False
 
         if config.gradient_accumulation_fusion and not _grad_accum_fusion_available:
+            # Tiancheng: Gradient accumulation fusion is provided by APEX.
             raise RuntimeError(
                 "ColumnParallelLinear was called with gradient_accumulation_fusion set "
                 "to True but the custom CUDA extension fused_weight_gradient_mlp_cuda "
@@ -740,6 +749,11 @@ class ColumnParallelLinear(torch.nn.Module):
                 "cannot be enabled at the same time."
             )
 
+        # Tiancheng: Important implementation in linear_with_grad_accumulation_and_async_allreduce. Answers to:
+        # 1. Why async TP AR not compatible with SP?
+        # 2. How to overlap comp&comm in two cases
+        # 3. What is grad accum fusion?
+        # Need to describe with a figure.
         self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
         self.explicit_expert_comm = self.is_expert and (
             self.sequence_parallel or self.expert_parallel
@@ -1002,6 +1016,7 @@ class RowParallelLinear(torch.nn.Module):
             self._forward_impl = linear_with_frozen_weight
         else:
             self._forward_impl = linear_with_grad_accumulation_and_async_allreduce
+        # Tiancheng: Only fused grad accum is used. No SP, No async TP AR.
         output_parallel = self._forward_impl(
             input=input_parallel,
             weight=self.weight,

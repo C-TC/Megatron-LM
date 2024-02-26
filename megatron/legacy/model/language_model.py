@@ -20,6 +20,7 @@ from .utils import init_method_normal, scaled_init_method_normal
 def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
                        bias=None):
     """LM logits using word embedding weights."""
+    # Tiancheng: Like ColumnParallelLinear.
     args = get_args()
     # Parallel logits.
     if args.async_tensor_model_parallel_allreduce or\
@@ -234,6 +235,7 @@ class Embedding(MegatronModule):
 
         # Dropout.
         if self.sequence_parallel:
+            # Tiancheng: Returns a slice, no comm.
             embeddings = tensor_parallel.scatter_to_sequence_parallel_region(embeddings)
             # `scatter_to_sequence_parallel_region` returns a view, which prevents
             # the original tensor from being garbage collected. Clone to facilitate GC.
