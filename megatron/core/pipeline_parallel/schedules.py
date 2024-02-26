@@ -413,6 +413,9 @@ def forward_backward_no_pipelining(
     return forward_data_store
 
 
+# Tiancheng: overlap_p2p_comm applies to steady state in 1F1B interleaved schedule.
+# If on: forward-> async send forward and receive forward -> backward -> async send backward and receive backward
+# If off: forward -> backward -> synced send_forward_backward_recv_forward_backward
 def forward_backward_pipelining_with_interleaving(
     *,
     forward_step_func,
@@ -1151,6 +1154,7 @@ def forward_backward_pipelining_without_interleaving(
         data_iterator = data_iterator[0]
 
     config = get_model_config(model)
+    # Tiancheng: no overlap p2p comm for non-interleaved pipeline parallelism.
     if config.overlap_p2p_comm:
         raise ValueError(
             "Non-interleaved pipeline parallelism does not support overlapping p2p communication"
@@ -1190,6 +1194,7 @@ def forward_backward_pipelining_without_interleaving(
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
 
+    # Tiancheng: Micro-batch level activation recomptutation to exhaust available GPU memory.
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches
     # within the maximum outstanding micro-batch backpropagations.
     # Micro-batches with the ids less than 'num_microbatches_with_partial_activation_checkpoints'

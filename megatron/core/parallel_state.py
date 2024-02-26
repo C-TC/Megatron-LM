@@ -307,6 +307,8 @@ def initialize_model_parallel(
     distributed_timeout_minutes: int = 30,
     order: str = "tp-cp-ep-dp-pp",
 ) -> None:
+    # Tiancheng: Important. Note for efficiency, the caller should make sure adjacent ranks
+    # are on the same DGX box.
     """Initialize model data parallel groups.
 
     Args:

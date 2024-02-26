@@ -313,6 +313,8 @@ def _communicate(
         )
 
     # Send tensors in both the forward and backward directions as appropriate.
+    # Tiancheng: Either overlap_p2p_comm or batch_p2p_comm. batch_isend_irecv for batch_p2p_comm.
+    # ring_exchange is an NV internal prototype feature.
     if config.use_ring_exchange_p2p:
 
         def _ring_exchange_wrapper(**kwargs):

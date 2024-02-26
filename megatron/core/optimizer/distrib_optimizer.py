@@ -1171,6 +1171,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # pre-hook when this all-gather finishes (to ensure that the communication
         # kernels don't head-of-line block the compute kernels since we run with
         # CUDA_DEVICE_MAX_CONNECTIONS=1 to support sequence parallelism).
+        # Tiancheng: Overlap param buffer allgather with forward.
         if self.overlap_param_gather:
             self._dispatch_gather_model_params(all_gather_handle_index=0)
 

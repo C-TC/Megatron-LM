@@ -186,6 +186,7 @@ def _initialize_tp_communicators():
        raise RuntimeError("Tensor Parallel Communication/GEMM Overlap optimization needs 'yaml' and "
              "'transformer_engine' packages") 
 
+    # Tiancheng: TP communication overlap is only available for transformer engine.
     args = get_args()
 
     if args.tp_comm_overlap_cfg is not None:

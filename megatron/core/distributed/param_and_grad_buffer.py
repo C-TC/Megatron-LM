@@ -146,6 +146,7 @@ class Bucket:
         call to complete. When overlap_grad_reduce is set to False, makes synchronous call.
         """
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
+        # Tiancheng: overlap grad sync with backpropagation.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync()
             return

@@ -260,6 +260,7 @@ class CheckpointFunction(torch.autograd.Function):
                 "please use .backward() if possible"
             )
         inputs = ctx.saved_tensors
+        # Tiancheng: Split activations to TP groups. Extra comm.
         if ctx.distribute_saved_activations:
             safely_set_viewless_tensor_data(
                 inputs[0], gather_split_1d_tensor(inputs[0].data).view(ctx.input_0_shape)

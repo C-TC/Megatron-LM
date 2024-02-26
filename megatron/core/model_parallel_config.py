@@ -8,6 +8,7 @@ import torch
 
 @dataclass
 class ModelParallelConfig:
+    # Tiancheng: tp comm overlap options (starts with tp_comm_) only possible in transformer engine.
     """Base configuration for Megatron Core
 
     The initialization function has an argument for each parameter.
