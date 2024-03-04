@@ -89,7 +89,11 @@ def initialize_megatron(
         _compile_dependencies()
 
         if args.tp_comm_overlap:
+           if args.rank == 0:
+                print("> initializing tensor parallel communicators for tp_comm_overlap...", flush=True)
            _initialize_tp_communicators()
+           if args.rank == 0:
+                print("> initializing communicators complete...", flush=True)
 
         # No continuation function
         return None

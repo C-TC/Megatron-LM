@@ -2,6 +2,7 @@
 #SBATCH --job-name="megatron-llama2-pretrain"
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1        # Do not change
+#SBATCH --cpus-per-task=64
 #SBATCH --gpus-per-node=4          # number of gpus per node
 #SBATCH --partition=nvgpu
 #SBATCH --time=00:10:00            # total run time limit (HH:MM:SS)
@@ -11,6 +12,7 @@
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_DEBUG=WARN
 
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 # Extra debugging flags, slow down training
 # export TORCH_CPP_LOG_LEVEL=INFO
 # export TORCH_DISTRIBUTED_DEBUG=DETAIL
@@ -21,7 +23,8 @@ GPUS_PER_NODE=4
 GPU_NUM=$((${GPUS_PER_NODE}*${NNODES}))
 WORLD_SIZE=$((${GPUS_PER_NODE}*${NNODES}))
 MASTER_PORT=$(expr 10000 + $(echo -n $SLURM_JOBID | tail -c 4))
-MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+MASTER_ADDR=$(hostname)
+echo "WORLD_SIZE=${WORLD_SIZE}, MASTER_PORT=${MASTER_PORT}, MASTER_ADDR=${MASTER_ADDR}"
 # Parallelism variables
 TP=4
 PP=1
@@ -73,11 +76,20 @@ DISTRIBUTED_ARGS=" \
        --tensor-model-parallel-size ${TP} \
        --pipeline-model-parallel-size ${PP} \
        --distributed-backend nccl \
-       --use-distributed-optimizer \
        --sequence-parallel \
+       --tp-comm-overlap \
        "    
 
+if [[ ${DP} -gt 1 ]]; then
+    DISTRIBUTED_ARGS+="\
+       --use-distributed-optimizer \
+       --overlap-param-gather \
+       --overlap-grad-reduce \
+       "
+fi
+
 NETWORK_SIZE_ARGS=" \
+       --use-mcore-models \
        --num-layers ${NUM_LAYERS} \
        --hidden-size ${HIDDEN_SIZE} \
        --num-attention-heads ${NUM_HEAD} \

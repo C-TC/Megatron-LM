@@ -5,6 +5,7 @@ Dockerfile & toml file in `image` dir.
 
 Dockerfile based on NGC PyTorch container.
 
+Build the container in nvgpu partition.
 
 ## Tokenizer
 

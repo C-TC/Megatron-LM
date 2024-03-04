@@ -2,8 +2,9 @@ FROM nvcr.io/nvidia/pytorch:24.01-py3
  
 # to avoid interaction with apt-get
 ENV DEBIAN_FRONTEND=noninteractive
- 
-RUN apt-get update && apt-get install -y --allow-downgrades --allow-change-held-packages --no-install-recommends \
+
+RUN apt-get update && apt-get dist-upgrade --yes && \                                               
+    apt-get install --no-install-recommends --yes \ 
         build-essential \
         automake \
         autoconf \
