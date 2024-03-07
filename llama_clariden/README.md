@@ -33,3 +33,8 @@ Before submitting, change `BASE_PATH` in sbatch file to correct location.
 During configuration, only 1 process on each node. Then torchrun will spawn the rest processes, so that 1 process controls one GPU, this is suggested by torch.distributed team.
 
 `sbatch pretrain_llama2.sbatch` to submit scaling job.
+
+## Traces
+Custom `nvtx` annotations were added to the megatron source code to navigate the traces better. 
+
+`sbatch pretarin_llama2_traces.sbatch` to submit job including tracing (Nvidia Nsight Systems). This will generate `.nsys-rep` file that can be downloaded and opened with the Nvidia Nsight Systems GUI to investigate traces. Configuration of what to trace is defined at the end of the `.sbatch` script.
