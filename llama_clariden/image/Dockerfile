@@ -13,4 +13,4 @@ RUN apt-get update && apt-get install -y --allow-downgrades --allow-change-held-
         ca-certificates \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-RUN pip install datasets accelerate evaluate tokenizers sentencepiece transformers nltk deepspeed flash-attn
+RUN pip install datasets accelerate evaluate tokenizers sentencepiece transformers nltk deepspeed flash-attn nvtx

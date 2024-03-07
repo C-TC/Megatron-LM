@@ -6,6 +6,8 @@ from typing import Callable, Iterator, List, Optional, Union
 import torch
 from torch.autograd.variable import Variable
 
+import nvtx
+
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import p2p_communication
@@ -353,38 +355,42 @@ def forward_backward_no_pipelining(
     input_tensor, output_tensor_grad = None, None
     with no_sync_func():
         for i in range(num_microbatches - 1):
-            output_tensor = forward_step(
-                forward_step_func,
-                data_iterator,
-                model,
-                num_microbatches,
-                input_tensor,
-                forward_data_store,
-                config,
-                collect_non_loss_data,
-                is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
-            )
+            with nvtx.annotate(message="microbatch_forward", color="blue"):
+                output_tensor = forward_step(
+                    forward_step_func,
+                    data_iterator,
+                    model,
+                    num_microbatches,
+                    input_tensor,
+                    forward_data_store,
+                    config,
+                    collect_non_loss_data,
+                    is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
+                )
             if not forward_only:
-                backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+                with nvtx.annotate(message="microbatch_backward", color="green"):
+                    backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
-    output_tensor = forward_step(
-        forward_step_func,
-        data_iterator,
-        model,
-        num_microbatches,
-        input_tensor,
-        forward_data_store,
-        config,
-        collect_non_loss_data,
-        is_first_microbatch=check_first_val_step(
-            first_val_step, forward_only, num_microbatches == 1
-        ),
-    )
+    with nvtx.annotate(message="microbatch_forward", color="blue"):
+        output_tensor = forward_step(
+            forward_step_func,
+            data_iterator,
+            model,
+            num_microbatches,
+            input_tensor,
+            forward_data_store,
+            config,
+            collect_non_loss_data,
+            is_first_microbatch=check_first_val_step(
+                first_val_step, forward_only, num_microbatches == 1
+            ),
+        )
 
     if not forward_only:
-        backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        with nvtx.annotate(message="microbatch_backward", color="green"):
+            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
     if config.timers is not None:
         config.timers('forward-backward').stop()
@@ -392,7 +398,8 @@ def forward_backward_no_pipelining(
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
         # data parallelism and layernorm all-reduce for sequence parallelism).
-        config.finalize_model_grads_func([model])
+        with nvtx.annotate(message="sync_grads", color="red"):
+            config.finalize_model_grads_func([model])
 
     return forward_data_store
 
