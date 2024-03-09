@@ -3,6 +3,7 @@
 
 import os
 import torch
+import nvtx
 from functools import partial
 from typing import Union
 from megatron import get_args
@@ -98,6 +99,7 @@ def get_batch(data_iterator):
 
     return batch.values()
 
+@nvtx.annotate(message="loss", color="blue")
 def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
     """Loss function.
 

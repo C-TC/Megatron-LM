@@ -6,6 +6,7 @@ import os
 import math
 import numpy as np
 import torch
+import nvtx
 import torch.nn.functional as F
 from typing import Optional
 
@@ -1595,6 +1596,7 @@ class ParallelTransformer(MegatronModule):
     def _get_layer(self, layer_number):
         return self.layers[layer_number]
 
+    @nvtx.annotate(message="checkpointed_forward", color="blue")
     def _checkpointed_forward(self, hidden_states, attention_mask,
                               encoder_output, enc_dec_attn_mask,
                               rotary_pos_emb, is_first_microbatch):
@@ -1684,6 +1686,7 @@ class ParallelTransformer(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
+    @nvtx.annotate(message="transformer_forward", color="blue")
     def forward(self, hidden_states, attention_mask,
                 encoder_output=None, enc_dec_attn_mask=None,
                 retriever_input=None,
@@ -1773,10 +1776,11 @@ class ParallelTransformer(MegatronModule):
                     for index in range(self.num_layers):
                         layer = self._get_layer(index)
 
-                        hidden_states = layer(
-                            hidden_states,
-                            attention_mask,
-                            **forward_kwargs)
+                        with nvtx.annotate(message="layer", color="blue"):
+                            hidden_states = layer(
+                                hidden_states,
+                                attention_mask,
+                                **forward_kwargs)
 
                         # First Retro decoder layer returns both hidden_states
                         # and retriever_output. Make retriever_output available
