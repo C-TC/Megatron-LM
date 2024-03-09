@@ -152,6 +152,7 @@ def custom_backward(output, grad_output):
     )
 
 
+@nvtx.annotate(message="forward_step", color="blue")
 def forward_step(
     forward_step_func,
     data_iterator,
@@ -236,6 +237,7 @@ def forward_step(
     return [output_tensor]
 
 
+@nvtx.annotate(message="backward_step", color="blue")
 def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
     """Backward step through passed-in output tensor.
 
@@ -355,42 +357,38 @@ def forward_backward_no_pipelining(
     input_tensor, output_tensor_grad = None, None
     with no_sync_func():
         for i in range(num_microbatches - 1):
-            with nvtx.annotate(message="microbatch_forward", color="blue"):
-                output_tensor = forward_step(
-                    forward_step_func,
-                    data_iterator,
-                    model,
-                    num_microbatches,
-                    input_tensor,
-                    forward_data_store,
-                    config,
-                    collect_non_loss_data,
-                    is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
-                )
+            output_tensor = forward_step(
+                forward_step_func,
+                data_iterator,
+                model,
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                collect_non_loss_data,
+                is_first_microbatch=check_first_val_step(first_val_step, forward_only, i == 0),
+            )
             if not forward_only:
-                with nvtx.annotate(message="microbatch_backward", color="green"):
-                    backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+                backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
-    with nvtx.annotate(message="microbatch_forward", color="blue"):
-        output_tensor = forward_step(
-            forward_step_func,
-            data_iterator,
-            model,
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            collect_non_loss_data,
-            is_first_microbatch=check_first_val_step(
-                first_val_step, forward_only, num_microbatches == 1
-            ),
-        )
+    output_tensor = forward_step(
+        forward_step_func,
+        data_iterator,
+        model,
+        num_microbatches,
+        input_tensor,
+        forward_data_store,
+        config,
+        collect_non_loss_data,
+        is_first_microbatch=check_first_val_step(
+            first_val_step, forward_only, num_microbatches == 1
+        ),
+    )
 
     if not forward_only:
-        with nvtx.annotate(message="microbatch_backward", color="green"):
-            backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

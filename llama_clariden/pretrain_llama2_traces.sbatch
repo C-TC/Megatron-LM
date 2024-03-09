@@ -95,9 +95,12 @@ NETWORK_SIZE_ARGS=" \
        "
 
 LOGGING_ARGS=" \
+       --log-throughput \
+       --timing-log-level 0 \
        --log-timers-to-tensorboard \
        --log-validation-ppl-to-tensorboard \
        --log-memory-to-tensorboard \
+       --log-world-size-to-tensorboard \
        "
 
 REGULATIZATION_ARGS=" \
@@ -121,6 +124,7 @@ TRAINING_ARGS=" \
        --exit-interval 2 \
        --recompute-activations \
        --recompute-granularity selective \
+       --tensorboard-dir ${BASE_PATH} \
        "
 
 INITIALIZATION_ARGS=" \
@@ -139,8 +143,6 @@ CHECKPOINTING_ARGS=" \
        --finetune \
        --no-load-optim \
        --no-load-rng \
-       --save ${SAVE_PATH} \
-       --save-interval 20 \
        "
 
 MIXED_PRECISION_ARGS=" \
@@ -181,10 +183,8 @@ CMD="\
 
 NSYS="\
        nsys profile \
-       --trace='nvtx,cuda,cudnn,cublas,cusparse,mpi' \
+       --trace='nvtx,cuda,mpi' \
        --cuda-memory-usage='true' \
-       --gpu-metrics-device='all' \
-       --stats='true' \
        --output='${BASE_PATH}/trace_%q{SLURM_NODEID}_%q{SLURM_PROCID}.nsys-rep' \
        "
 
