@@ -16,9 +16,6 @@ set -exo pipefail
 if [[ -z $MBS ]]; then MBS=4; fi
 if [[ -z $GBS ]]; then GBS=32; fi
 if [[ -z $MOE_GROUPED_GEMM ]]; then MOE_GROUPED_GEMM=0; fi
-if [[ -z $ALLOW_NONDETERMINISTIC ]]; then ALLOW_NONDETERMINISTIC=0; fi
-if [[ -z $VOCAB_FILE ]]; then VOCAB_FILE="/workspace/data/gpt3_data/vocab.json" ; fi
-if [[ -z $MERGE_FILE ]]; then MERGE_FILE="/workspace/data/gpt3_data/merges.txt" ; fi
 
 GPUS_PER_NODE=8
 # Change for multinode config
@@ -34,16 +31,10 @@ TRAINING_DTYPE=fp16
 
 if [[ $USE_CORE -eq 1 ]]; then
        echo "Running using megatron core"
-       TRANSFORMER_IMPL=transformer_engine
+       TRANSFORMER_IMPL=local
        TRAINING_DTYPE=bf16
-       command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=$ALLOW_NONDETERMINISTIC;"
+       command="$command export NVTE_ALLOW_NONDETERMINISTIC_ALGO=0;"
        USE_MCORE=1
-fi
-
-if [[ $USE_FP8 -eq 1 ]]; then
-       echo "Running FP8 Training using Transformer Engine ..."
-       ADDITIONAL_PARAMS+=" --fp8-format hybrid --fp8-amax-history-len 1024 --fp8-amax-compute-algo max"
-       USE_TE=1
 fi
 
 if [[ $MOE_GROUPED_GEMM -eq 1 ]]; then
@@ -68,64 +59,64 @@ if [[ $CHECKPOINT_RESUME_TEST -eq 1 ]]; then
          MAX_STEPS=100
        fi
 else
-       __SAVE_INTERVAL=${SAVE_INTERVAL:-10000}  # inf
+       __SAVE_INTERVAL=10000  # inf
 fi
 if [[ -n "$CKPT_FORMAT" ]] && [[ "$CKPT_FORMAT" != 'torch' ]]; then
-       echo "Using distributed checkpoint format $CKPT_FORMAT..."
-       [[ "$CKPT_FORMAT" == 'zarr' ]] && command="$command pip install zarr tensorstore==0.1.45;"
+       echo "Using distributed checkpoint format..."
+       command="$command pip install zarr tensorstore==0.1.45;"
        ADDITIONAL_PARAMS+=" --use-dist-ckpt --dist-ckpt-format $CKPT_FORMAT"
 fi
 set +x
-# Runs the "345M" parameter model
+
+DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
 
 build_torch_run_cmd() {
-  DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NUM_NODES"
-  [[ -n "$RUN_CMD" ]] && run_cmd=$RUN_CMD || run_cmd="torchrun $DISTRIBUTED_ARGS"
-  torch_run_cmd="$run_cmd \
-       pretrain_gpt.py \
-       --num-layers 12 \
-       --hidden-size 512 \
-       --num-attention-heads 8 \
-       --log-params-norm \
-       --log-num-zeros-in-grad \
-       --log-validation-ppl-to-tensorboard \
-       --log-timers-to-tensorboard \
-       --tensorboard-dir ${TENSORBOARD_DIR} \
-       --micro-batch-size ${MBS:-4} \
-       --global-batch-size ${GBS:-32} \
-       --seq-length 1024 \
-       --max-position-embeddings 1024 \
-       --train-iters $MAX_STEPS \
-       --timing-log-level 2 \
-       --lr-decay-iters 320000 \
-       --save $CHECKPOINT_PATH \
-       --load $CHECKPOINT_PATH \
-       --data-path $DATA_PATH \
-       --vocab-file $VOCAB_FILE \
-       --merge-file $MERGE_FILE \
-       --split 949,50,1 \
-       --distributed-backend nccl \
-       --lr 0.00015 \
-       --lr-decay-style cosine \
-       --min-lr 1.0e-5 \
-       --weight-decay 1e-2 \
-       --clip-grad 1.0 \
-       --lr-warmup-fraction .01 \
-       --log-interval 1 \
-       --save-interval $__SAVE_INTERVAL \
-       --eval-interval 1000 \
-       --eval-iters 10 \
-       --transformer-impl $TRANSFORMER_IMPL \
-       --tensor-model-parallel-size $TP_SIZE \
-       --pipeline-model-parallel-size $PP_SIZE \
-       --no-bias-swiglu-fusion \
-       --no-rope-fusion \
-       ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
-       ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
-       ${USE_MCORE:+--use-mcore-models} \
-       --no-gradient-accumulation-fusion \
-       ${DATA_CACHE:+--data-cache-path "$DATA_CACHE"} \
-       --${TRAINING_DTYPE}"
+  torch_run_cmd="torchrun $DISTRIBUTED_ARGS \
+    pretrain_vlm.py \
+      --num-layers 12 \
+      --hidden-size 512 \
+      --num-attention-heads 8 \
+      --log-params-norm \
+      --log-num-zeros-in-grad \
+      --log-validation-ppl-to-tensorboard \
+      --log-timers-to-tensorboard \
+      --tensorboard-dir ${TENSORBOARD_DIR} \
+      --micro-batch-size ${MBS:-4} \
+      --global-batch-size ${GBS:-32} \
+      --seq-length 1024 \
+      --max-position-embeddings 1024 \
+      --train-iters $MAX_STEPS \
+      --timing-log-level 2 \
+      --lr-decay-iters 320000 \
+      --save $CHECKPOINT_PATH \
+      --load $CHECKPOINT_PATH \
+      --split 949,50,1 \
+      --tokenizer-type NullTokenizer \
+      --vocab-size=8192 \
+      --distributed-backend nccl \
+      --lr 0.00015 \
+      --lr-decay-style cosine \
+      --min-lr 1.0e-5 \
+      --weight-decay 1e-2 \
+      --clip-grad 1.0 \
+      --lr-warmup-fraction .01 \
+      --log-interval 1 \
+      --save-interval $__SAVE_INTERVAL \
+      --eval-interval 1000 \
+      --eval-iters 10 \
+      --transformer-impl $TRANSFORMER_IMPL \
+      --tensor-model-parallel-size $TP_SIZE \
+      --pipeline-model-parallel-size $PP_SIZE \
+      --no-bias-swiglu-fusion \
+      --no-rope-fusion \
+      ${VP_SIZE:+--num-layers-per-virtual-pipeline-stage "$VP_SIZE"} \
+      ${ADDITIONAL_PARAMS:+$ADDITIONAL_PARAMS} \
+      ${USE_MCORE:+--use-mcore-models} \
+      --no-gradient-accumulation-fusion \
+      --${TRAINING_DTYPE} \
+      --img-h 336 \
+      --img-w 336 \
+      --patch-dim 14"
 
   if [[ "${TRAINING_DTYPE}" == "fp16" ]]; then
       torch_run_cmd+=" --apply-query-key-layer-scaling"
@@ -166,7 +157,7 @@ echo "-------------------- THE FINAL PRETRAIN SCRIPT COMMAND THAT WILL BE RUN --
 echo "$command"
 echo "-----------------------------------------------------------------------------"
 
-echo "$command" > $SCRIPTS_DIR/pretrain_gpt3_distributed_command.sh
+echo "$command" > $SCRIPTS_DIR/pretrain_llava_distributed_command.sh
 eval $command
 
 echo "Saving test results to $TENSORBOARD_DIR"
@@ -181,13 +172,8 @@ if [[ $SKIP_PYTEST != 1 ]]; then
         pytest ./tests/functional_tests/python_test_utils/test_resume_checkpoint_pipeline.py
     else
         echo "Running pytest checks against golden values"
+        export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/${JOB_NAME}.json"
         export LOGS_DIR=$TENSORBOARD_DIR
-        if [[ $USE_FP8 -eq 1 ]]; then
-          export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/gpt3-345m-weekly-dgx-h100-1n8g-mcore-tp1-pp1-bf16-baseline.json"
-          pytest ./tests/functional_tests/python_test_utils/test_fp8_ci_pipeline.py
-        else
-          export EXPECTED_METRICS_FILE="./tests/functional_tests/test_results/jet/${JOB_NAME}.json"
-          pytest ./tests/functional_tests/python_test_utils/test_ci_pipeline.py
-        fi
+        pytest ./tests/functional_tests/python_test_utils/test_ci_pipeline.py
     fi
 fi
