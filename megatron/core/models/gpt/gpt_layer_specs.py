@@ -97,6 +97,7 @@ def _get_mlp_module_spec(
             ),
         )
     else:
+        # CTC: so Megatron MoE model has no TE linear support in MLP part.
         # Mixture of experts with modules in megatron core.
         return ModuleSpec(
             module=MoELayer,

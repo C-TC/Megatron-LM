@@ -89,6 +89,7 @@ class Router(ABC, MegatronModule):
         self.layer_number = layer_number
 
 
+# CTC: moe router, with multiple aux loss options.
 class TopKRouter(Router):
     """Route each token to the top-k experts."""
 
@@ -265,6 +266,7 @@ class TopKRouter(Router):
         self.hidden = input.shape[-1]
 
         # Apply input jitter
+        # CTC: apply input noise, then gating with aux loss.
         input = self.apply_input_jitter(input)
         logits = self.gating(input)
         logits = logits.view(-1, self.config.num_moe_experts)

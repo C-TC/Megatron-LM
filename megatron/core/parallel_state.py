@@ -268,6 +268,7 @@ class RankGenerator(object):
         return mask
 
     def get_ranks(self, token, independent_ep=False):
+        # CTC: IMPORTANT: see here and above, EP stoles DP ranks!
         '''Get rank group by input token.
 
         Arguments:
@@ -432,11 +433,13 @@ def initialize_model_parallel(
         tensor_model_parallel_size * pipeline_model_parallel_size * context_parallel_size
     )
 
+    # CTC: EP should divide DP? Yes, because EP steals DP ranks.
     if data_parallel_size % expert_model_parallel_size != 0:
         raise RuntimeError(
             f"data_parallel_size ({data_parallel_size}) is not divisible by expert_model_parallel_size "
         )
 
+    # CTC: no CP for MoE models :(
     if expert_model_parallel_size > 1 and context_parallel_size > 1:
         raise RuntimeError(
             f"combination of expert model prallellism and context parallelism is not supported"

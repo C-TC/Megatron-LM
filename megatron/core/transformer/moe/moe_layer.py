@@ -51,6 +51,7 @@ class BaseMoELayer(MegatronModule, ABC):
         self.router.set_layer_number(layer_number)
 
 
+# CTC: moe layer, now only dropless option.
 class MoELayer(BaseMoELayer):
     """Mixture of experts Layer **currently only supports no token dropping**.
 
@@ -84,6 +85,7 @@ class MoELayer(BaseMoELayer):
 
     def forward(self, hidden_states: torch.Tensor):
         # process MoE
+        # CTC: TODO: IMPORTANT: so in MoE with TP, each EP rank is doing redundant work in ATT part?
         scores, indices = self.router(hidden_states)
         (dispatched_input, tokens_per_expert) = self.token_dispatcher.token_permutation(
             hidden_states, scores, indices

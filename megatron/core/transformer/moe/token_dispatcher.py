@@ -85,6 +85,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     def token_permutation(
         self, hidden_states: torch.Tensor, max_prob: torch.Tensor, max_ind: torch.Tensor
     ):
+        # See the nice explaination. first permute across ep ranks, then within ep ranks.
         """Dispatch tokens to local experts. It's composed of two stages:
         (1) Permute the tokens across the expert parallel devices. After this stage,
         each device receives all of the tokens assigned to its local set of experts
@@ -109,6 +110,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         # Permute the tokens across the expert parallel devices.
         if self.config.sequence_parallel or (self.config.expert_model_parallel_size > 1):
             # [S*B/TP, H] -> [S*B, H]
+            # CTC: AG input and topk indices from TP ranks :( It's AG from TP&EP ranks! Efficiency problem?
             global_hidden_states = tensor_parallel.gather_from_sequence_parallel_region_to_moe(
                 hidden_states
             )
@@ -130,6 +132,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
                 self.local_probs = max_prob
 
             # Reshape global_local_mask to be compatible with Tensor.gather
+            # CTC: When input is on CUDA, torch.nonzero() causes host-device synchronization.
             global_local_map = global_local_mask.nonzero()[:, 0]
             self.global_local_map = global_local_map.view(-1, 1).expand(-1, hidden_states.shape[-1])
             local_hidden_states = torch.gather(global_hidden_states, 0, self.global_local_map)
@@ -274,6 +277,7 @@ class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
         return output_total, output_bias_total
 
 
+# CTC: All2All based MoE, seems more efficient than AG variant.
 class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
     """
     AlltoAll Based Token dispatcher.
@@ -400,6 +404,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # Perform tensor parallel AlltoAll communication
         # hidden_states: [S*B/TP, H] -> [S*B, H/TP]
+        # CTC: from sequence parallel to hidden dimension parallel!
         if parallel_state.get_tensor_model_parallel_world_size() > 1:
             hidden_states = tensor_parallel.all_to_all_sp2hp(hidden_states)
 
@@ -410,6 +415,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         )
 
         # Perform expert parallel AlltoAll communication
+        # CTC: varlen alltoall
         global_input_tokens = tensor_parallel.all_to_all(
             parallel_state.get_expert_model_parallel_group(),
             permutated_local_input_tokens,
@@ -425,6 +431,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
         # Perform tensor parallel All-Gather
         # global_input_tokens: [SEQL, H/TP] -> [SEQL, H]
+        # CTC: Clever way to reduce communication by a factor of n_tp.
         if parallel_state.get_tensor_model_parallel_world_size() > 1:
             global_input_tokens = tensor_parallel.all_gather_last_dim_from_tensor_parallel_region(
                 global_input_tokens

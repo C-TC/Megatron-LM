@@ -22,6 +22,7 @@ from megatron.core.transformer.moe import grouped_gemm_util as gg
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
+# CTC: num_local_experts indicates no support for expert sharding here?
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using CUTLASS GroupedGEMM.
     
@@ -152,6 +153,7 @@ class GroupedMLP(MegatronModule):
             # No token is allocated for local experts.
             assert torch.count_nonzero(tokens_per_expert) == 0
 
+            # CTC: why?
             # Make sure parameters still have gradients when no tokens are routed to this set of experts.
             w1 = self.weight1.view(self.config.hidden_size, -1)
             w2 = self.weight2.view(-1, self.config.hidden_size)
@@ -169,6 +171,7 @@ class GroupedMLP(MegatronModule):
         )
 
 
+# CTC: "ungrouped" MLP
 class SequentialMLP(MegatronModule):
     """An implementation of the Experts layer using a sequence of MLP layers.
     
