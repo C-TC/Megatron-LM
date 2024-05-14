@@ -23,6 +23,9 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 
 # CTC: num_local_experts indicates no support for expert sharding here?
+# CTC: in megablocks, two types of MLP: sparse and grouped. sparse is what discussed in the paper. 
+# And grouped use cutlass grouped gemm for most arch and cublas for sm90 (poor support of sm90 in cutlass). 
+# see https://github.com/databricks/megablocks/issues/35.
 class GroupedMLP(MegatronModule):
     """An efficient implementation of the Experts layer using CUTLASS GroupedGEMM.
     
