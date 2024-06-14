@@ -13,13 +13,15 @@ from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from megatron import get_timers
 from megatron import print_rank_0
 from megatron.core import mpu, tensor_parallel
-from megatron.model import DistributedDataParallel as LocalDDP
+# from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
 from megatron.model.module import param_is_not_shared
 from megatron.utils import unwrap_model
 
-from .clip_grads import clip_grad_norm_fp32, count_zeros_fp32
+from .clip_grads import count_zeros_fp32
 
+from msamp.megatron import clip_grad_norm_fp32
+from msamp.megatron import FP8DistributedDataParallel as LocalDDP
 
 def _zero_grad_group_helper(group, set_to_none):
     """Zero out the gradient for a group of parameters.

@@ -33,7 +33,7 @@ from megatron.initialize import initialize_megatron
 from megatron.initialize import write_args_to_tensorboard
 from megatron.initialize import set_jit_fusion_options
 from megatron.optimizer_param_scheduler import OptimizerParamScheduler
-from megatron.model import DistributedDataParallel as LocalDDP
+# from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.utils import check_adlr_autoresume_termination
 from megatron.utils import unwrap_model
 from megatron.data.data_samplers import build_pretraining_data_loader
@@ -42,6 +42,10 @@ from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory
 from megatron.model.vision.knn_monitor import compute_feature_bank
 
+from msamp.nn import LinearReplacer
+from msamp.common.dtype import Dtypes
+from msamp.nn.state import model_state
+from msamp.megatron import FP8DistributedDataParallel as LocalDDP
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -216,6 +220,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     args = get_args()
     args.model_type = model_type
 
+    if args.msamp and args.transformer_impl == 'transformer_engine':
+        import msamp.te
+
     # Build model.
     if mpu.get_pipeline_model_parallel_world_size() > 1 and \
        args.virtual_pipeline_model_parallel_size is not None:
@@ -295,6 +302,20 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # Fp16 conversion.
     if args.fp16 or args.bf16:
         model = [Float16Module(model_module, args) for model_module in model]
+
+    if args.msamp:
+        print_rank_0("msamp is enabled")
+        model_state.use_fp8_ddp = True
+        for i in range(len(model)):
+            if args.transformer_impl == 'transformer_engine':
+                from msamp.te import TeReplacer
+                model[i] = TeReplacer.replace(model[i])
+            else:
+                model[i] = LinearReplacer.replace(model[i], Dtypes.kfloat16,
+                                                  src_rank=mpu.get_data_parallel_src_rank(),
+                                                  group=mpu.get_data_parallel_group())
+
+            print_rank_0(model[i])
 
     if wrap_with_ddp:
         if args.DDP_impl == 'torch':
@@ -629,6 +650,22 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed(barrier=True)
         elapsed_time_per_iteration = elapsed_time / total_iterations
+
+        # Compute throughput.
+        samples_per_sec = batch_size / elapsed_time_per_iteration
+
+        # Compute tflops.
+        seq_len = args.seq_length
+        hidden_size = args.hidden_size
+        num_layers = args.num_layers
+        vocab_size = args.padded_vocab_size
+
+        checkpoint_activations_factor = 4 if args.recompute_granularity else 3
+        print_rank_last(f'checkpoint_activations_factor: {checkpoint_activations_factor}')
+        coefficient = 24
+        flops_per_iteration = (coefficient * checkpoint_activations_factor * batch_size * seq_len * num_layers * (hidden_size**2)) * (1. + (seq_len / (6. * hidden_size)) + (vocab_size / (16. * num_layers * hidden_size)))
+        tflops = flops_per_iteration / (elapsed_time_per_iteration * args.world_size * (10**12))
+
         if writer:
             if args.log_timers_to_tensorboard:
                 writer.add_scalar('iteration-time',
@@ -660,6 +697,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             total_loss_dict[skipped_iters_key])
         log_string += ' number of nan iterations: {:3d} |'.format(
             total_loss_dict[nan_iters_key])
+
+        log_string += ' samples per second: {:.3f} |'.format(samples_per_sec)
+        log_string += ' TFLOPs: {:.2f} |'.format(tflops)
+
         total_loss_dict[advanced_iters_key] = 0
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
