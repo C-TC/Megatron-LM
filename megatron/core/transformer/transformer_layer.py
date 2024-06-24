@@ -16,6 +16,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
 
+from megatron.global_timer import ModuleTimerPair
 
 @dataclass
 class TransformerLayerSubmodules:
@@ -129,6 +130,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
         # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
         self.bias_dropout_add_exec_handler = torch.enable_grad
+        
+        self.norm1_timer = ModuleTimerPair(f"layer{self.layer_number}.norm1")
+        self.attention_timer = ModuleTimerPair(f"layer{self.layer_number}.attention")
+        self.attention_bda_timer = ModuleTimerPair(f"layer{self.layer_number}.attention_bda")
+        self.norm2_timer = ModuleTimerPair(f"layer{self.layer_number}.norm2")
+        self.mlp_timer = ModuleTimerPair(f"layer{self.layer_number}.mlp")
+        self.mlp_bda_timer = ModuleTimerPair(f"layer{self.layer_number}.mlp_bda")
 
     def _get_layer_offset(self):
 
@@ -171,10 +179,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         # Residual connection.
         residual = hidden_states
 
+        hidden_states = self.norm1_timer.begin_timers(hidden_states)
         # Optional Input Layer norm
         input_layernorm_output = self.input_layernorm(hidden_states)
+        input_layernorm_output = self.norm1_timer.end_timers(input_layernorm_output)
 
         # Self attention.
+        input_layernorm_output = self.attention_timer.begin_timers(input_layernorm_output)
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
@@ -182,13 +193,16 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
         )
+        attention_output_with_bias = self.attention_timer.end_timers(attention_output_with_bias)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
+            attention_output_with_bias = self.attention_bda_timer.begin_timers(attention_output_with_bias)
             hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
                 attention_output_with_bias, residual, self.hidden_dropout
             )
+            hidden_states = self.attention_bda_timer.end_timers(hidden_states)
 
         # Residual connection.
         residual = hidden_states
@@ -218,17 +232,23 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         residual = hidden_states
 
         # Optional Layer norm post the cross-attention.
+        hidden_states = self.norm2_timer.begin_timers(hidden_states)
         pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+        pre_mlp_layernorm_output = self.norm2_timer.end_timers(pre_mlp_layernorm_output)
 
         # MLP.
+        pre_mlp_layernorm_output = self.mlp_timer.begin_timers(pre_mlp_layernorm_output)
         mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+        mlp_output_with_bias = self.mlp_timer.end_timers(mlp_output_with_bias)
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         with self.bias_dropout_add_exec_handler():
+            mlp_output_with_bias = self.mlp_bda_timer.begin_timers(mlp_output_with_bias)
             hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
                 mlp_output_with_bias, residual, self.hidden_dropout
             )
+            hidden_states = self.mlp_bda_timer.end_timers(hidden_states)
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,

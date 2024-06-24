@@ -18,6 +18,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
 
+from megatron.global_timer import ModuleTimerPair
 
 class GPTModel(LanguageModule):
     """GPT Transformer language model.
@@ -131,6 +132,8 @@ class GPTModel(LanguageModule):
 
         if self.pre_process or self.post_process:
             self.setup_embeddings_and_output_layer()
+        
+        self.module_timer = ModuleTimerPair("PostProcessing")
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -196,7 +199,9 @@ class GPTModel(LanguageModule):
             **(extra_block_kwargs or {}),
         )
 
+        hidden_states = self.module_timer.begin_timers(hidden_states)
         if not self.post_process:
+            hidden_states = self.module_timer.end_timers(hidden_states)
             return hidden_states
 
         # logits and loss
@@ -207,10 +212,12 @@ class GPTModel(LanguageModule):
 
         if labels is None:
             # [s b h] => [b s h]
-            return logits.transpose(0, 1).contiguous()
+            out = self.module_timer.end_timers(logits.transpose(0, 1).contiguous())
+            return out
 
         loss = self.compute_language_model_loss(labels, logits)
 
+        loss = self.module_timer.end_timers(loss)
         return loss
 
     def sharded_state_dict(

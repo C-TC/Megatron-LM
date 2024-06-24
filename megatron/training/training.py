@@ -57,6 +57,7 @@ from .global_vars import (
     get_num_microbatches,
     update_num_microbatches)
 
+from megatron.global_timer import GlobalTimerCollection
 
 stimer = StragglerDetector()
 
@@ -1031,6 +1032,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         num_microbatches = get_num_microbatches()
         update_num_microbatches(args.consumed_train_samples, consistency_check=True)
 
+        GlobalTimerCollection.set_iteration(iteration)
         args.curr_iteration = iteration
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
@@ -1047,6 +1049,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         num_fp_ops = num_floating_point_operations(args, batch_size)
         num_floating_point_operations_so_far += num_fp_ops
         total_flops += num_fp_ops
+        GlobalTimerCollection.log_module_timers()
 
         # Logging.
         loss_scale = optimizer.get_loss_scale().item()

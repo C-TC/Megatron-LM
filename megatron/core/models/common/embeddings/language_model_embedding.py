@@ -8,6 +8,7 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.global_timer import ModuleTimerPair
 
 
 class LanguageModelEmbedding(MegatronModule):
@@ -75,6 +76,7 @@ class LanguageModelEmbedding(MegatronModule):
 
         # Embeddings dropout
         self.embedding_dropout = torch.nn.Dropout(self.config.hidden_dropout)
+        self.module_timer = ModuleTimerPair("embedding")
 
     def zero_parameters(self):
         """Zero out all parameters in embedding."""
@@ -97,6 +99,7 @@ class LanguageModelEmbedding(MegatronModule):
         Returns:
             Tensor: The output embeddings
         """
+        input_ids = self.module_timer.begin_timers(input_ids)
         word_embeddings = self.word_embeddings(input_ids)
         if self.add_position_embedding:
             position_embeddings = self.position_embeddings(position_ids)
@@ -134,4 +137,5 @@ class LanguageModelEmbedding(MegatronModule):
         else:
             embeddings = self.embedding_dropout(embeddings)
 
+        embeddings = self.module_timer.end_timers(embeddings)
         return embeddings

@@ -24,6 +24,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
+from megatron.global_timer import ModuleTimerPair
 
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
@@ -104,6 +105,10 @@ class Attention(MegatronModule, ABC):
             is_expert=False,
             tp_comm_buffer_name='proj',
         )
+        self.qkv_linear_timer = ModuleTimerPair(f"layer{layer_number}.attention.qkv_linear")
+        self.rope_timer = ModuleTimerPair(f"layer{layer_number}.attention.rope")
+        self.attention_core_timer = ModuleTimerPair(f"layer{layer_number}.attention.core")
+        self.o_linear_timer = ModuleTimerPair(f"layer{layer_number}.attention.o_linear")
 
     def _checkpointed_attention_forward(
         self,
@@ -261,7 +266,9 @@ class Attention(MegatronModule, ABC):
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
+        hidden_states = self.qkv_linear_timer.begin_timers(hidden_states)
         query, key, value = self.get_query_key_value_tensors(hidden_states, key_value_states)
+        query = self.qkv_linear_timer.end_timers(query)
 
         # ===================================================
         # Adjust key, value, and rotary_pos_emb for inference
@@ -278,6 +285,7 @@ class Attention(MegatronModule, ABC):
         # ================================================
         # relative positional embedding (rotary embedding)
         # ================================================
+        query = self.rope_timer.begin_timers(query)
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
 
@@ -292,6 +300,7 @@ class Attention(MegatronModule, ABC):
             key = apply_rotary_pos_emb(
                 key, k_pos_emb, config=self.config, cu_seqlens=cu_seqlens_kv,
             )
+        key = self.rope_timer.end_timers(key)
 
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
@@ -302,6 +311,7 @@ class Attention(MegatronModule, ABC):
         # core attention computation
         # ==================================
 
+        query = self.attention_core_timer.begin_timers(query)
         if self.checkpoint_core_attention and self.training:
             core_attn_out = self._checkpointed_attention_forward(
                 query,
@@ -328,11 +338,14 @@ class Attention(MegatronModule, ABC):
             # note that batch is a dummy dimension in the packed case
             core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
 
+        core_attn_out = self.attention_core_timer.end_timers(core_attn_out)
         # =================
         # Output. [sq, b, h]
         # =================
 
+        core_attn_out = self.o_linear_timer.begin_timers(core_attn_out)
         output, bias = self.linear_proj(core_attn_out)
+        output = self.o_linear_timer.end_timers(output)
 
         return output, bias
 

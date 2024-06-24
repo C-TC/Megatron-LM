@@ -22,6 +22,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
+from megatron.global_timer import ModuleTimerPair
 
 @dataclass
 class MLPSubmodules:
@@ -50,6 +51,7 @@ class MLP(MegatronModule):
         self,
         config: TransformerConfig,
         submodules: MLPSubmodules,
+        layer_number: int,
         is_expert: bool = False,
         input_size: int = None,
     ):
@@ -91,12 +93,18 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name='fc2',
         )
+        self.fc1_timer = ModuleTimerPair(f"layer.{layer_number}.mlp.fc1")
+        self.activation_func_timer = ModuleTimerPair(f"layer.{layer_number}.mlp.act")
+        self.fc2_timer = ModuleTimerPair(f"layer.{layer_number}.mlp.fc2")
 
     def forward(self, hidden_states):
 
         # [s, b, 4 * h/p]
+        hidden_states = self.fc1_timer.begin_timers(hidden_states)
         intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
+        intermediate_parallel = self.fc1_timer.end_timers(intermediate_parallel)
 
+        intermediate_parallel = self.activation_func_timer.begin_timers(intermediate_parallel)
         if self.config.bias_activation_fusion:
             if self.activation_func == F.gelu:
                 if self.config.gated_linear_unit:
@@ -125,8 +133,11 @@ class MLP(MegatronModule):
             else:
                 intermediate_parallel = self.activation_func(intermediate_parallel)
 
+        intermediate_parallel = self.activation_func_timer.end_timers(intermediate_parallel)
         # [s, b, h]
+        intermediate_parallel = self.fc2_timer.begin_timers(intermediate_parallel)
         output, output_bias = self.linear_fc2(intermediate_parallel)
+        output = self.fc2_timer.end_timers(output)
 
         return output, output_bias
 
