@@ -93,9 +93,9 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name='fc2',
         )
-        self.fc1_timer = ModuleTimerPair(f"layer.{layer_number}.mlp.fc1")
-        self.activation_func_timer = ModuleTimerPair(f"layer.{layer_number}.mlp.act")
-        self.fc2_timer = ModuleTimerPair(f"layer.{layer_number}.mlp.fc2")
+        self.fc1_timer = ModuleTimerPair(f"layer{layer_number}.mlp.fc1")
+        self.activation_func_timer = ModuleTimerPair(f"layer{layer_number}.mlp.act")
+        self.fc2_timer = ModuleTimerPair(f"layer{layer_number}.mlp.fc2")
 
     def forward(self, hidden_states):
 

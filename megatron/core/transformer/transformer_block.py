@@ -27,6 +27,7 @@ from megatron.core.transformer.transformer_layer import BaseTransformerLayer, Tr
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import make_sharded_tensor_for_checkpoint, make_viewless_tensor
 
+from megatron.global_timer import ModuleTimerPair
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
 
@@ -142,6 +143,7 @@ class TransformerBlock(MegatronModule):
 
         self._build_layers()
         self.num_layers_per_pipeline_rank = len(self.layers)
+        self.layer_timers = [ModuleTimerPair(f"layer{i+1}") for i in range(len(self.layers))]
 
     def _build_layers(self):
         # Transformer layers.
@@ -380,6 +382,7 @@ class TransformerBlock(MegatronModule):
                 for l_no, layer in enumerate(self.layers):
                     with self.offload_context:
                         if (len(self.cuda_graphs) == 0) or (not self.training):
+                            hidden_states = self.layer_timers[l_no].begin_timers(hidden_states)
                             hidden_states, context = layer(
                                 hidden_states=hidden_states,
                                 attention_mask=attention_mask,
@@ -389,6 +392,7 @@ class TransformerBlock(MegatronModule):
                                 inference_params=inference_params,
                                 packed_seq_params=packed_seq_params,
                             )
+                            hidden_states = self.layer_timers[l_no].end_timers(hidden_states)
                             # CUDA graph doesn't output context and is expected to be None
                             assert (
                                 (context is None)

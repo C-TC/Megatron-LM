@@ -51,6 +51,7 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     'partition_stride': 1,
 }
 
+from megatron.global_timer import ModuleTimerPair
 
 def param_is_not_tensor_parallel_duplicate(param):
     return (hasattr(param, 'tensor_model_parallel') and param.tensor_model_parallel) or (
@@ -178,6 +179,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         self.embedding_dim = embedding_dim
         self.reduce_scatter_embeddings = reduce_scatter_embeddings
         self.tensor_model_parallel_size = get_tensor_model_parallel_world_size()
+        # self.module_timer = ModuleTimerPair("VPEmbedding")
         # Divide the weight matrix along the vocaburaly dimension.
         (
             self.vocab_start_index,
@@ -227,6 +229,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             masked_input = input_
         # Get the embeddings.
+        # masked_input = self.module_timer.begin_timers(masked_input)
         if self.deterministic_mode:
             output_parallel = self.weight[masked_input]
         else:
@@ -243,6 +246,7 @@ class VocabParallelEmbedding(torch.nn.Module):
         else:
             # Reduce across all the model parallel GPUs.
             output = reduce_from_tensor_model_parallel_region(output_parallel)
+        # output = self.module_timer.end_timers(output)
         return output
 
     def sharded_state_dict(
