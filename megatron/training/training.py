@@ -57,6 +57,7 @@ from .global_vars import (
     get_num_microbatches,
     update_num_microbatches)
 
+from megatron.core.pipeline_parallel.pp_timer import PPTimerCollection
 
 stimer = StragglerDetector()
 
@@ -1047,6 +1048,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         num_fp_ops = num_floating_point_operations(args, batch_size)
         num_floating_point_operations_so_far += num_fp_ops
         total_flops += num_fp_ops
+        PPTimerCollection.step()
 
         # Logging.
         loss_scale = optimizer.get_loss_scale().item()
@@ -1180,6 +1182,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
                 gc.collect()
 
+    PPTimerCollection.log_module_timers()
     track_e2e_metrics()
 
     # Flush TensorBoard and WandB writers.

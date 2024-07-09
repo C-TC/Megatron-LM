@@ -12,6 +12,8 @@ from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import get_attr_wrapped_model, get_model_config, get_model_type
 
+from megatron.core.pipeline_parallel.pp_timer import PPTimerCollection
+
 # Types
 Shape = Union[List[int], torch.Size]
 
@@ -183,6 +185,8 @@ def forward_step(
     Returns output tensor."""
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
+        
+    PPTimerCollection.record_timer_start(current_microbatch, 0, is_forward=True)
 
     if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
         model.set_is_first_microbatch()
@@ -230,6 +234,8 @@ def forward_step(
 
     if config.timers is not None:
         config.timers('forward-compute').stop()
+    
+    PPTimerCollection.record_timer_end()
 
     # Set the loss scale for the auxiliary loss of the MoE layer.
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale explicitly.
@@ -258,7 +264,7 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
-def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
+def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, microbatch_id=None):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -273,6 +279,8 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
+    
+    PPTimerCollection.record_timer_start(microbatch_id, 0, is_forward=False)
 
     # Retain the grad on the input_tensor.
     unwrap_input_tensor_grad = False
@@ -322,6 +330,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     if config.timers is not None:
         config.timers('backward-compute').stop()
 
+    PPTimerCollection.record_timer_end()
     return input_tensor_grad
 
 
@@ -637,6 +646,8 @@ def forward_backward_pipelining_with_interleaving(
                 input_tensors[model_chunk_id].append(None)
         input_tensor = input_tensors[model_chunk_id][-1]
 
+        # torch.cuda.nvtx.range_push(f"forward_mb{microbatch_id}_chunk{model_chunk_id}")
+        PPTimerCollection.record_timer_start(microbatch_id, model_chunk_id, is_forward=True)
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator[model_chunk_id],
@@ -652,6 +663,8 @@ def forward_backward_pipelining_with_interleaving(
             ),
             current_microbatch=current_microbatch,
         )
+        PPTimerCollection.record_timer_end()
+        # torch.cuda.nvtx.range_pop()
         output_tensors[model_chunk_id].append(output_tensor)
 
         nonlocal total_num_tokens
@@ -682,9 +695,13 @@ def forward_backward_pipelining_with_interleaving(
         input_tensor = input_tensors[model_chunk_id].pop(0)
         output_tensor = output_tensors[model_chunk_id].pop(0)
         output_tensor_grad = output_tensor_grads[model_chunk_id].pop(0)
+        # torch.cuda.nvtx.range_push(f"backward_mb{microbatch_id}_chunk{model_chunk_id}")
+        PPTimerCollection.record_timer_start(microbatch_id, model_chunk_id, is_forward=False)
         input_tensor_grad = backward_step(
             input_tensor, output_tensor, output_tensor_grad, model_type, config
         )
+        # torch.cuda.nvtx.range_pop()
+        PPTimerCollection.record_timer_end()
 
         # launch grad synchronization (custom grad sync)
         # Note: Asynchronous communication tends to slow down compute.
@@ -1268,6 +1285,7 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
 
         input_tensor = recv_forward(recv_tensor_shapes, config)
+        # torch.cuda.nvtx.range_push(f"forward_step_{i}")
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -1281,6 +1299,7 @@ def forward_backward_pipelining_without_interleaving(
             check_first_val_step(first_val_step, forward_only, i == 0),
             current_microbatch=i,
         )
+        # torch.cuda.nvtx.range_pop()
         send_forward(output_tensor, send_tensor_shapes, config)
         total_num_tokens += num_tokens.item()
 
@@ -1307,6 +1326,7 @@ def forward_backward_pipelining_without_interleaving(
         else:
             checkpoint_activations_microbatch = None
 
+        # torch.cuda.nvtx.range_push(f"forward_step_{i+num_warmup_microbatches}")
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -1322,6 +1342,7 @@ def forward_backward_pipelining_without_interleaving(
             ),
             current_microbatch=i + num_warmup_microbatches,
         )
+        # torch.cuda.nvtx.range_pop()
         total_num_tokens += num_tokens.item()
 
         if forward_only:
@@ -1351,9 +1372,11 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
 
+            # torch.cuda.nvtx.range_push(f"backward_step_{i}")
             input_tensor_grad = backward_step(
-                input_tensor, output_tensor, output_tensor_grad, model_type, config
+                input_tensor, output_tensor, output_tensor_grad, model_type, config, i
             )
+            # torch.cuda.nvtx.range_pop()
 
             if last_iteration:
                 input_tensor = None
@@ -1381,9 +1404,11 @@ def forward_backward_pipelining_without_interleaving(
 
             output_tensor_grad = recv_backward(send_tensor_shapes, config)
 
+            # torch.cuda.nvtx.range_push(f"backward_step_{i+num_microbatches_remaining}")
             input_tensor_grad = backward_step(
-                input_tensor, output_tensor, output_tensor_grad, model_type, config
+                input_tensor, output_tensor, output_tensor_grad, model_type, config, i+num_microbatches_remaining
             )
+            # torch.cuda.nvtx.range_pop()
 
             send_backward(input_tensor_grad, recv_tensor_shapes, config)
 
