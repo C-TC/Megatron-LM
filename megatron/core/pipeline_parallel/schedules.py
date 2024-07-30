@@ -175,6 +175,7 @@ def forward_step(
     checkpoint_activations_microbatch=None,
     is_first_microbatch=False,
     current_microbatch=None,
+    chunk_id=0,
 ):
 
     """Forward step for passed-in model.
@@ -186,7 +187,7 @@ def forward_step(
     if config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
         
-    PPTimerCollection.record_timer_start(current_microbatch, 0, is_forward=True)
+    PPTimerCollection.record_timer_start(current_microbatch, chunk_id, is_forward=True)
 
     if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
         model.set_is_first_microbatch()
@@ -264,7 +265,7 @@ def forward_step(
     return [output_tensor], num_tokens
 
 
-def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, microbatch_id=None):
+def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, microbatch_id=None, model_chunk_id=0):
     """Backward step through passed-in output tensor.
 
     If last stage, output_tensor_grad is None, otherwise gradient of loss
@@ -280,7 +281,7 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
     
-    PPTimerCollection.record_timer_start(microbatch_id, 0, is_forward=False)
+    PPTimerCollection.record_timer_start(microbatch_id, model_chunk_id, is_forward=False)
 
     # Retain the grad on the input_tensor.
     unwrap_input_tensor_grad = False
@@ -647,7 +648,6 @@ def forward_backward_pipelining_with_interleaving(
         input_tensor = input_tensors[model_chunk_id][-1]
 
         # torch.cuda.nvtx.range_push(f"forward_mb{microbatch_id}_chunk{model_chunk_id}")
-        PPTimerCollection.record_timer_start(microbatch_id, model_chunk_id, is_forward=True)
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator[model_chunk_id],
@@ -662,8 +662,8 @@ def forward_backward_pipelining_with_interleaving(
                 first_val_step, forward_only, is_first_microbatch_for_model_chunk(microbatch_id),
             ),
             current_microbatch=current_microbatch,
+            chunk_id=model_chunk_id,
         )
-        PPTimerCollection.record_timer_end()
         # torch.cuda.nvtx.range_pop()
         output_tensors[model_chunk_id].append(output_tensor)
 
@@ -696,12 +696,10 @@ def forward_backward_pipelining_with_interleaving(
         output_tensor = output_tensors[model_chunk_id].pop(0)
         output_tensor_grad = output_tensor_grads[model_chunk_id].pop(0)
         # torch.cuda.nvtx.range_push(f"backward_mb{microbatch_id}_chunk{model_chunk_id}")
-        PPTimerCollection.record_timer_start(microbatch_id, model_chunk_id, is_forward=False)
         input_tensor_grad = backward_step(
-            input_tensor, output_tensor, output_tensor_grad, model_type, config
+            input_tensor, output_tensor, output_tensor_grad, model_type, config, microbatch_id, model_chunk_id
         )
         # torch.cuda.nvtx.range_pop()
-        PPTimerCollection.record_timer_end()
 
         # launch grad synchronization (custom grad sync)
         # Note: Asynchronous communication tends to slow down compute.
