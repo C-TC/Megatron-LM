@@ -769,13 +769,19 @@ class ParallelTransformerLayer(MegatronModule):
         self.bf16 = config.bf16
         self.fp32_residual_connection = config.fp32_residual_connection
 
-        # Layernorm on the input data.
-        self.input_layernorm = LayerNorm(
-            config.hidden_size,
-            eps=config.layernorm_epsilon,
-            no_persist_layer_norm=args.no_persist_layer_norm,
-            sequence_parallel=config.sequence_parallel,
-            apply_layernorm_1p=args.apply_layernorm_1p)
+        if args.normalization == "LayerNorm":
+            # Layernorm on the input data.
+            self.input_layernorm = LayerNorm(
+                config.hidden_size,
+                eps=config.layernorm_epsilon,
+                no_persist_layer_norm=args.no_persist_layer_norm,
+                sequence_parallel=config.sequence_parallel,
+                apply_layernorm_1p=args.apply_layernorm_1p)
+        elif args.normalization == "HadarmardNorm":
+            from megatron.model import HadamardNorm
+            self.input_layernorm = HadamardNorm()
+        else:
+            raise ValueError(f"Normalization type {args.normalization} not supported.")
 
         # Self attention.
         self.self_attention = ParallelAttention(
@@ -787,13 +793,18 @@ class ParallelTransformerLayer(MegatronModule):
         self.bias_dropout_fusion = config.bias_dropout_fusion
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0.0 else None
 
-        # Layernorm on the attention output
-        self.post_attention_layernorm = LayerNorm(
-            config.hidden_size,
-            eps=config.layernorm_epsilon,
-            no_persist_layer_norm=not config.persist_layer_norm,
-            sequence_parallel=config.sequence_parallel,
-            apply_layernorm_1p=args.apply_layernorm_1p)
+        if args.normalization == "LayerNorm":
+            # Layernorm on the attention output
+            self.post_attention_layernorm = LayerNorm(
+                config.hidden_size,
+                eps=config.layernorm_epsilon,
+                no_persist_layer_norm=not config.persist_layer_norm,
+                sequence_parallel=config.sequence_parallel,
+                apply_layernorm_1p=args.apply_layernorm_1p)
+        elif args.normalization == "HadarmardNorm":
+            self.post_attention_layernorm = HadamardNorm()
+        else:
+            raise ValueError(f"Normalization type {args.normalization} not supported.")
 
         # Cross attention.
         if self.layer_type in (LayerType.decoder,

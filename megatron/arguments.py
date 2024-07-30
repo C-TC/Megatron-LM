@@ -380,6 +380,9 @@ def validate_args(args, defaults={}):
     if args.normalization == "RMSNorm":
         assert args.transformer_impl == "transformer_engine", "TransformerEngine is required for RMSNorm."
 
+    if args.normalization == "HadarmardNorm":
+        assert args.transformer_impl == "local", "Local transformer is required for HadamardNorm."
+
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
@@ -470,7 +473,7 @@ def _add_transformer_engine_args(parser):
                        help='Algorithm for computing amax from history',
                        dest='fp8_amax_compute_algo')
     group.add_argument('--normalization', default='LayerNorm',
-                       choices=['LayerNorm', 'RMSNorm'],
+                       choices=['LayerNorm', 'RMSNorm', 'HadarmardNorm'],
                        help='Which normalization technique to use.',
                        dest='normalization')
 
