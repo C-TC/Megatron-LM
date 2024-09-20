@@ -376,12 +376,15 @@ def validate_args(args, defaults={}):
                 retro_args.retro_gpt_chunk_length
             set_retro_args(retro_args)
 
-    # Normalization args
-    if args.normalization == "RMSNorm":
-        assert args.transformer_impl == "transformer_engine", "TransformerEngine is required for RMSNorm."
+    # # Normalization args
+    # if args.normalization == "RMSNorm":
+    #     assert args.transformer_impl == "transformer_engine", "TransformerEngine is required for RMSNorm."
 
     if args.normalization == "HadarmardNorm":
         assert args.transformer_impl == "local", "Local transformer is required for HadamardNorm."
+    
+    if args.hadamard_before_ln:
+        assert args.transformer_impl == "local", "Local transformer is required for hadamard_before_ln."
 
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
@@ -476,6 +479,7 @@ def _add_transformer_engine_args(parser):
                        choices=['LayerNorm', 'RMSNorm', 'HadarmardNorm'],
                        help='Which normalization technique to use.',
                        dest='normalization')
+    group.add_argument('--hadamard-before-ln', action='store_true', dest='hadamard_before_ln',)
 
     return parser
 

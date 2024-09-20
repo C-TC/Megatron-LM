@@ -1,7 +1,8 @@
 # Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 from .fused_layer_norm import MixedFusedLayerNorm as LayerNorm
-from .hadamard_norm import HadamardNorm
+from .hadamard_norm import HadamardNorm, HadamardTransform
+from .rms_norm import RMSNorm
 
 from .distributed import DistributedDataParallel
 from .bert_model import BertModel

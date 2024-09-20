@@ -15,4 +15,11 @@ class HadamardNorm(nn.Module):
         input = hadamard_transform(input, torch.rsqrt(torch.tensor(hid_dim).float()))
         return self.act(input)
 
+class HadamardTransform(nn.Module):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
     
+    def forward(self, input):
+        hid_dim = input.size(-1)
+        input = hadamard_transform(input, torch.rsqrt(torch.tensor(hid_dim).float()))
+        return input

@@ -12,7 +12,7 @@ from megatron import get_timers, get_args, get_retro_args, core, get_num_microba
 from .module import MegatronModule
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
-from megatron.model import LayerNorm
+from megatron.model import LayerNorm, RMSNorm
 from megatron.model.enums import AttnMaskType, LayerType, AttnType
 from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
@@ -46,6 +46,8 @@ except ImportError:
     tensor of the same size. We use the following arguments:
         hyperparameters: transformer hyperparameters
 """
+
+MAX_INPUT_ACTIVATION_LOG = None
 
 class DropPath(MegatronModule):
     """Drop paths (Stochastic Depth) per sample
@@ -780,8 +782,19 @@ class ParallelTransformerLayer(MegatronModule):
         elif args.normalization == "HadarmardNorm":
             from megatron.model import HadamardNorm
             self.input_layernorm = HadamardNorm()
+        elif args.normalization == "RMSNorm":
+            self.input_layernorm = RMSNorm(
+                config.hidden_size,
+                eps=config.layernorm_epsilon,
+                sequence_parallel=config.sequence_parallel)
         else:
             raise ValueError(f"Normalization type {args.normalization} not supported.")
+
+        if args.hadamard_before_ln:
+            from megatron.model import HadamardTransform
+            self.hadamard_transform_before_ln = HadamardTransform()
+        else:
+            self.hadamard_transform_before_ln = None
 
         # Self attention.
         self.self_attention = ParallelAttention(
@@ -803,6 +816,11 @@ class ParallelTransformerLayer(MegatronModule):
                 apply_layernorm_1p=args.apply_layernorm_1p)
         elif args.normalization == "HadarmardNorm":
             self.post_attention_layernorm = HadamardNorm()
+        elif args.normalization == "RMSNorm":
+            self.post_attention_layernorm = RMSNorm(
+                config.hidden_size,
+                eps=config.layernorm_epsilon,
+                sequence_parallel=config.sequence_parallel)
         else:
             raise ValueError(f"Normalization type {args.normalization} not supported.")
 
@@ -1071,9 +1089,20 @@ class ParallelTransformerLayer(MegatronModule):
                 inference_params=None,
                 rotary_pos_emb=None):
         # hidden_states: [s, b, h]
-
-        # Layer norm at the beginning of the transformer layer.
-        layernorm_output = self.input_layernorm(hidden_states)
+        global MAX_INPUT_ACTIVATION_LOG
+        with torch.no_grad():
+            if MAX_INPUT_ACTIVATION_LOG is None:
+                # abs max of input activations
+                MAX_INPUT_ACTIVATION_LOG = torch.max(torch.abs(hidden_states))
+            else:
+                MAX_INPUT_ACTIVATION_LOG = torch.max(MAX_INPUT_ACTIVATION_LOG, torch.max(torch.abs(hidden_states)))
+        
+        if self.hadamard_transform_before_ln is not None:
+            layernorm_output = self.hadamard_transform_before_ln(hidden_states)
+            layernorm_output = self.input_layernorm(layernorm_output)
+        else:
+            # Layer norm at the beginning of the transformer layer.
+            layernorm_output = self.input_layernorm(hidden_states)
 
         # Self attention.
         attention_output, attention_bias = \
@@ -1116,8 +1145,13 @@ class ParallelTransformerLayer(MegatronModule):
                                               training=self.training)
             layernorm_input = residual + self.drop_path(out)
 
-        # Layer norm post the self attention.
-        layernorm_output = self.post_attention_layernorm(layernorm_input)
+
+        if self.hadamard_transform_before_ln is not None:
+            layernorm_output = self.hadamard_transform_before_ln(layernorm_input)
+            layernorm_output = self.post_attention_layernorm(layernorm_output)
+        else:
+            # Layer norm post the self attention.
+            layernorm_output = self.post_attention_layernorm(layernorm_input)
 
         # Cross attention.
         if self.layer_type == LayerType.encoder:

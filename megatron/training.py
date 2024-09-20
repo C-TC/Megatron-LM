@@ -10,6 +10,7 @@ import time
 _TRAIN_START_TIME = time.time()
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from megatron.model.transformer import MAX_INPUT_ACTIVATION_LOG
 
 from megatron import get_args
 from megatron import get_signal_handler
@@ -46,6 +47,7 @@ from msamp.nn import LinearReplacer
 from msamp.common.dtype import Dtypes
 from msamp.nn.state import model_state
 from msamp.megatron import FP8DistributedDataParallel as LocalDDP
+
 
 def print_datetime(string):
     """Note that this call will sync across all ranks."""
@@ -646,6 +648,12 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 mem_stats["allocation.all.current"],
                 iteration,
             )
+        # world rank
+        my_rank = torch.distributed.get_rank()
+        global MAX_INPUT_ACTIVATION_LOG
+        if MAX_INPUT_ACTIVATION_LOG is not None:
+            writer.add_scalar(f'max_input_act_transformer_block_rank{my_rank}', MAX_INPUT_ACTIVATION_LOG.item(), iteration)
+            MAX_INPUT_ACTIVATION_LOG = None
 
     if iteration % args.log_interval == 0:
         elapsed_time = timers('interval-time').elapsed(barrier=True)
