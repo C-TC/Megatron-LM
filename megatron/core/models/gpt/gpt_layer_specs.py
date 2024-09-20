@@ -13,6 +13,7 @@ from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.torch_rms_norm import CompiledRMSNorm
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -94,6 +95,7 @@ def get_gpt_layer_local_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
     qk_layernorm: Optional[bool] = False,
+    normalization: Optional[str] = "LayerNorm",
 ) -> ModuleSpec:
     """Use this spec for an implementation using only modules in Megatron-Core.
 
@@ -109,6 +111,8 @@ def get_gpt_layer_local_spec(
     mlp = _get_mlp_module_spec(
         use_te=False, num_experts=num_experts, moe_grouped_gemm=moe_grouped_gemm
     )
+    if normalization == "RMSNorm":
+        LNImpl = CompiledRMSNorm
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
