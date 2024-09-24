@@ -15,6 +15,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import make_viewless_tensor
+from megatron.training.global_vars import get_args
 
 
 @dataclass
@@ -164,6 +165,13 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
     def _get_layer_offset(self):
         """Get the index number of this layer, given the level of pipelining."""
+        args = get_args()
+        if args.enable_cdcpp_scheduler:
+            from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
+            dev_id = parallel_state.get_pipeline_model_parallel_rank()
+            chunk_id = parallel_state.get_virtual_pipeline_model_parallel_rank()
+            return get_cdc_pp_scheduler().get_layer_offset(dev_id, chunk_id)
+        
         pipeline_rank = parallel_state.get_pipeline_model_parallel_rank()
 
         num_layers_per_pipeline_rank = (

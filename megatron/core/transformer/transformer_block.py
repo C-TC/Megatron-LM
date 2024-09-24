@@ -20,6 +20,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import BaseTransformerLayer
 from megatron.core.transformer.utils import sharded_state_dict_default
 from megatron.core.utils import make_viewless_tensor
+from megatron.training.global_vars import get_args
 
 try:
     from megatron.core.extensions.transformer_engine import (
@@ -55,6 +56,13 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
     Returns:
         int: The number of layers to be built for the current pipeline stage.
     """
+    args = get_args()
+    if args.enable_cdcpp_scheduler:
+        from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
+        dev_id = parallel_state.get_pipeline_model_parallel_rank()
+        chunk_id = parallel_state.get_virtual_pipeline_model_parallel_rank()
+        return get_cdc_pp_scheduler().get_num_layers_in_chunk(dev_id, chunk_id)        
+    
     if config.first_pipeline_num_layers is not None or config.last_pipeline_num_layers is not None:
         assert (
             parallel_state.get_virtual_pipeline_model_parallel_world_size() is None

@@ -1213,6 +1213,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     while iteration < args.train_iters:
         if args.profile and torch.distributed.get_rank() in args.profile_ranks:
+            # torch.cuda.memory._record_memory_history()
             if args.use_pytorch_profiler:
                 prof.step()
             elif iteration == args.profile_step_start:
@@ -1425,6 +1426,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.profile and \
             iteration == args.profile_step_end and \
             torch.distributed.get_rank() in args.profile_ranks:
+            # torch.cuda.memory._dump_snapshot(f'{args.tensorboard_dir}/rank{torch.distributed.get_rank()}.json')
             if args.use_pytorch_profiler:
                 prof.stop()
             else:

@@ -1501,6 +1501,11 @@ def _add_mixed_precision_args(parser):
 
 def _add_distributed_args(parser):
     group = parser.add_argument_group(title='distributed')
+    
+    
+    group.add_argument('--enable_cdcpp_scheduler', action='store_true', default=False,)
+    group.add_argument('--static_schedule', type=str, default=None, choices=['1F1B', 'GPipe','Interleaved1F1B','Hanayo','ZBH1','ZBV',])
+
 
     group.add_argument('--tensor-model-parallel-size', type=int, default=1,
                        help='Degree of tensor model parallelism.')
