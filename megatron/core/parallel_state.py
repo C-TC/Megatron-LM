@@ -1793,12 +1793,32 @@ def _initialize_pp_extra_groups_communicators():
     prev_ranks = get_pipeline_extra_groups_prev_rank()
     next_ranks = get_pipeline_extra_groups_next_rank()
     ranks = get_pipeline_extra_rank()
+    
     assert len(pgs) == len(prev_ranks) == len(next_ranks) == len(ranks) == 4
     assert get_pipeline_model_parallel_world_size() % 2 == 0
+    
+    from megatron.training.global_vars import get_args
+    from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
+    from megatron.core.pipeline_parallel.cdc_scheduler import cdc_comm
+    args = get_args()
+    send_impl = dist.send
+    recv_impl = dist.recv
+    if args.enable_cdcpp_scheduler:
+        cdc_scheduler = get_cdc_pp_scheduler()
+        send_impl = cdc_scheduler.send
+        recv_impl = cdc_scheduler.recv
+        if cdc_scheduler.need_hook_recv_next():
+            recv_next_pg = get_pipeline_extra_recv_next_group()
+            recv_next_pg._register_on_completion_hook(cdc_comm.cdc_comm_completion_hook)
+        elif cdc_scheduler.need_hook_recv_prev():
+            recv_prev_pg = get_pipeline_extra_recv_prev_group()
+            recv_prev_pg._register_on_completion_hook(cdc_comm.cdc_comm_completion_hook)
+
+    # Initialize the communicators (blocking).
     for pg, prev_rank, next_rank, rank in zip(pgs, prev_ranks, next_ranks, ranks):
         if rank % 2 == 0:
-            dist.send(torch.tensor([1]), dst=next_rank, group=pg)
-            dist.recv(torch.tensor([1]), src=prev_rank, group=pg)
+            send_impl.send(torch.tensor([1]), dst=next_rank, group=pg)
+            recv_impl.recv(torch.tensor([1]), src=prev_rank, group=pg)
         else:
-            dist.recv(torch.tensor([1]), src=prev_rank, group=pg)
-            dist.send(torch.tensor([1]), dst=next_rank, group=pg)
+            recv_impl.recv(torch.tensor([1]), src=prev_rank, group=pg)
+            send_impl.send(torch.tensor([1]), dst=next_rank, group=pg)

@@ -27,6 +27,7 @@ from megatron.core.pipeline_parallel.cdc_scheduler.execution_planner import (
     ExecutionPlanner,
     TaskEvent,
 )
+import megatron.core.pipeline_parallel.cdc_scheduler.cdc_comm as cdc_comm
 
 
 _CDC_PP_SCHEDULER = None
@@ -53,15 +54,45 @@ class CDCPPScheduler:
         self.use_static_schedule = False
         self.pp_schedule: Pipeline = None
 
+        pp_size = args.pipeline_model_parallel_size
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        num_microbatch = get_num_microbatches()
         # static schedule
         if args.static_schedule is not None:
             self.use_static_schedule = True
-            pp_size = args.pipeline_model_parallel_size
-            num_microbatch = get_num_microbatches()
             self.pp_schedule = get_default_static_schedule(args.static_schedule, pp_size, num_microbatch)
         else:
             raise NotImplementedError()
 
+        # cross-DC
+        self.num_dc = args.num_dc
+        self.cdc_latency = args.cdc_latency
+        
+        # decide whether to insert hooks in PGs.
+        self.cdc_recv_prev = False
+        self.cdc_recv_next = False
+        
+        if self.num_dc > 1 and self.cdc_latency > 0:
+            self.pp_stages_per_dc = args.pp_stages_per_dc
+            if len(self.pp_stages_per_dc) == 0:
+                # naive split
+                self.pp_stages_per_dc = [pp_size // self.num_dc] * self.num_dc
+                for i in range(pp_size % self.num_dc):
+                    self.pp_stages_per_dc[i] += 1
+            elif len(self.pp_stages_per_dc) == 1:
+                self.pp_stages_per_dc = [self.pp_stages_per_dc[0]] * self.num_dc
+            assert sum(self.pp_stages_per_dc) == pp_size
+            assert any([stages > 1 for stages in self.pp_stages_per_dc]), "CDC requires at least one stage per DC due to limitation in cdc comm"
+            
+            # check if ocurrent rank on the boundary of DCs
+            dc_boundaries = [sum(self.pp_stages_per_dc[:i]) for i in range(1, self.num_dc)]
+            if pp_rank + 1 in dc_boundaries:
+                self.cdc_recv_next = True
+            if pp_rank in [(x + 1) % pp_size for x in dc_boundaries]:
+                self.cdc_recv_prev = True
+            assert not (self.cdc_recv_prev and self.cdc_recv_next), "CDC recv cannot be both prev and next"
+            
+                
         self.validate_args()
 
         self.pp_execution_planner = ExecutionPlanner(self.pp_schedule)
@@ -70,7 +101,6 @@ class CDCPPScheduler:
             self.pp_execution_planner.execution_plan
         )
 
-        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         self.pp_execution_plan_cur_device: List[ComputeTask] = self.pp_execution_plan[
             pp_rank
         ]
@@ -231,19 +261,19 @@ class CDCPPScheduler:
 
         if event.type == CommEventType.POST_SEND_NEXT:
             self.send_next_reqs[(event.mb_id, event.chunk_id, event.task_type)] = (
-                dist.isend(send_buffer, next_rank, group=send_next_group)
+                self.isend(send_buffer, next_rank, group=send_next_group)
             )
         elif event.type == CommEventType.POST_RECV_NEXT:
             self.recv_next_reqs[(event.mb_id, event.chunk_id, event.task_type)] = (
-                dist.irecv(recv_buffer, next_rank, group=recv_next_group)
+                self.irecv(recv_buffer, next_rank, group=recv_next_group)
             )
         elif event.type == CommEventType.POST_SEND_PREV:
             self.send_prev_reqs[(event.mb_id, event.chunk_id, event.task_type)] = (
-                dist.isend(send_buffer, prev_rank, group=send_prev_group)
+                self.isend(send_buffer, prev_rank, group=send_prev_group)
             )
         elif event.type == CommEventType.POST_RECV_PREV:
             self.recv_prev_reqs[(event.mb_id, event.chunk_id, event.task_type)] = (
-                dist.irecv(recv_buffer, prev_rank, group=recv_prev_group)
+                self.irecv(recv_buffer, prev_rank, group=recv_prev_group)
             )
         elif event.type == CommEventType.WAIT_SEND_NEXT:
             handle = self.send_next_reqs[(event.mb_id, event.chunk_id, event.task_type)]
@@ -526,3 +556,35 @@ class CDCPPScheduler:
 
     def get_forward_backward_func(self):
         return self.forward_backward_func
+
+
+    def get_cdc_recv_delay(self) -> int | float:
+        return self.cdc_latency
+    
+    def need_hook_recv_prev(self) -> bool:
+        return self.cdc_recv_prev
+    
+    def need_hook_recv_next(self) -> bool:
+        return self.cdc_recv_next
+
+    def send(self, tensor: torch.Tensor, dst: int, group: dist.ProcessGroupNCCL | None = None):
+        dist.send(tensor, dst, group=group)
+    
+    def isend(self, tensor: torch.Tensor, dst: int, group: dist.ProcessGroupNCCL | None = None) -> dist.Work:
+        return dist.isend(tensor, dst, group=group)
+    
+    def recv(self, tensor: torch.Tensor, src: int, group: dist.ProcessGroupNCCL | None = None):
+        prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
+        next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
+        if (src == prev_rank and self.cdc_recv_prev) or (src == next_rank and self.cdc_recv_next):
+            return cdc_comm.irecv(tensor, src, group=group).wait()
+        else:
+            dist.recv(tensor, src, group=group)
+    
+    def irecv(self, tensor: torch.Tensor, src: int, group: dist.ProcessGroupNCCL | None = None):
+        prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
+        next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
+        if (src == prev_rank and self.cdc_recv_prev) or (src == next_rank and self.cdc_recv_next):
+            return cdc_comm.irecv(tensor, src, group=group)
+        else:
+            return dist.irecv(tensor, src, group=group)
