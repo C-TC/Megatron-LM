@@ -1,6 +1,7 @@
 import contextlib
 from typing import Dict, Iterator, List, Tuple, Union
 
+from megatron.core.pipeline_parallel.cdc_scheduler.wgrad_store import WGradStore
 import torch
 import torch.distributed as dist
 from megatron.core import parallel_state
@@ -60,18 +61,20 @@ class CDCPPScheduler:
         # static schedule
         if args.static_schedule is not None:
             self.use_static_schedule = True
-            self.pp_schedule = get_default_static_schedule(args.static_schedule, pp_size, num_microbatch)
+            self.pp_schedule = get_default_static_schedule(
+                args.static_schedule, pp_size, num_microbatch
+            )
         else:
             raise NotImplementedError()
 
         # cross-DC
         self.num_dc = args.num_dc
         self.cdc_latency = args.cdc_latency
-        
+
         # decide whether to insert hooks in PGs.
         self.cdc_recv_prev = False
         self.cdc_recv_next = False
-        
+
         if self.num_dc > 1 and self.cdc_latency > 0:
             self.pp_stages_per_dc = args.pp_stages_per_dc
             if len(self.pp_stages_per_dc) == 0:
@@ -82,18 +85,21 @@ class CDCPPScheduler:
             elif len(self.pp_stages_per_dc) == 1:
                 self.pp_stages_per_dc = [self.pp_stages_per_dc[0]] * self.num_dc
             assert sum(self.pp_stages_per_dc) == pp_size
-            assert any([stages > 1 for stages in self.pp_stages_per_dc]), "CDC requires at least one stage per DC due to limitation in cdc comm"
-            
+            assert any(
+                [stages > 1 for stages in self.pp_stages_per_dc]
+            ), "CDC requires at least one stage per DC due to limitation in cdc comm"
+
             # check if ocurrent rank on the boundary of DCs
-            dc_boundaries = [sum(self.pp_stages_per_dc[:i]) for i in range(1, self.num_dc)]
+            dc_boundaries = [
+                sum(self.pp_stages_per_dc[:i]) for i in range(1, self.num_dc)
+            ]
             if pp_rank + 1 in dc_boundaries:
                 self.cdc_recv_next = True
             if pp_rank in [(x + 1) % pp_size for x in dc_boundaries]:
                 self.cdc_recv_prev = True
-            assert not (self.cdc_recv_prev and self.cdc_recv_next), "CDC recv cannot be both prev and next"
-            
-                
-        self.validate_args()
+            assert not (
+                self.cdc_recv_prev and self.cdc_recv_next
+            ), "CDC recv cannot be both prev and next"
 
         self.pp_execution_planner = ExecutionPlanner(self.pp_schedule)
         self.pp_execution_planner.generate_execution_plan()
@@ -104,6 +110,12 @@ class CDCPPScheduler:
         self.pp_execution_plan_cur_device: List[ComputeTask] = self.pp_execution_plan[
             pp_rank
         ]
+
+        self.wgrad_split = any(
+            [task.task_desc.type == "W" for task in self.pp_execution_plan_cur_device]
+        )
+
+        self.wgrad_store = WGradStore() if self.wgrad_split else None
 
         # p2p handles, (mb, chunk, type)
         self.send_next_reqs: Dict[Tuple, dist.Work] = {}
@@ -123,6 +135,8 @@ class CDCPPScheduler:
         # grad sync
         self.no_sync_func = None
         self.no_sync_context = None
+
+        self.validate_args()
 
     def clean_up(self):
         # get ready for the next iteration
@@ -173,19 +187,27 @@ class CDCPPScheduler:
             == self.pp_schedule.sys_config.num_chunks
         ), "For compatibility, virtual_pipeline_model_parallel_size is equivalent to number of chunks"
 
+        if self.wgrad_split:
+            assert (
+                args.gradient_accumulation_fusion
+            ), "W-grad split requires gradient accumulation fusion"
+
+    def get_wgrad_store(self):
+        return self.wgrad_store
+
     def get_layer_offset(self, dev_id, chunk_id):
         layers_list = self.get_num_layers_in_chunk(dev_id=None, chunk_id=None)
         execution_order = self.pp_schedule.get_pipeline_execution_order()
         idx_in_order = execution_order.index((dev_id, chunk_id))
-        return sum(layers_list[:idx_in_order])        
-    
+        return sum(layers_list[:idx_in_order])
+
     def get_num_layers_in_chunk(self, *, dev_id=None, chunk_id=None):
         # TODO: better model splitting
         # now we treat vocab and lm head as one layer each. and add unbalanced layers to first several chunks
         num_layer = self.args.num_layers
         execution_order = self.pp_schedule.get_pipeline_execution_order()
         total_chunks = len(execution_order)
-        
+
         head_tail_layers = (num_layer + 2) // total_chunks
         rest_layers = num_layer - head_tail_layers * 2
         rest_chunks = total_chunks - 2
@@ -194,27 +216,31 @@ class CDCPPScheduler:
         for i in range(remainder):
             layer_list[i] += 1
         layer_list = [head_tail_layers] + layer_list + [head_tail_layers]
-        
-        assert (dev_id is not None or chunk_id is not None) or (dev_id is None and chunk_id is None)
+
+        assert (dev_id is not None or chunk_id is not None) or (
+            dev_id is None and chunk_id is None
+        )
         if dev_id is not None and chunk_id is not None:
             return layer_list[execution_order.index((dev_id, chunk_id))]
         else:
             return layer_list
-        
+
     def _is_last_microbatch_for_model_chunk(
         self, compute_task: ComputeTask, number_of_microbatches
     ):
         # To enable grad sync in backward.
-        # TODO: W block
-        has_w_blocks = any(
-            [task.task_desc.type == "W" for task in self.pp_execution_plan_cur_device]
-        )
-        assert not has_w_blocks, "W blocks are not supported yet"
+        has_w_blocks = self.wgrad_split
 
-        return (
-            compute_task.task_desc.mb_id == number_of_microbatches - 1
-            and compute_task.task_desc.type == "B"
-        )
+        if has_w_blocks:
+            return (
+                compute_task.task_desc.mb_id == number_of_microbatches - 1
+                and compute_task.task_desc.type == "W"
+            )
+        else:
+            return (
+                compute_task.task_desc.mb_id == number_of_microbatches - 1
+                and compute_task.task_desc.type == "B"
+            )
 
     def schedule_comm_event(self, event: CommEvent, config, tensor_shape):
         send_next_group = parallel_state.get_pipeline_extra_send_next_group()
@@ -322,8 +348,6 @@ class CDCPPScheduler:
     ):
         config = get_model_config(model[0])
 
-        # TODO: set_virtual_pipeline_model_parallel_rank
-
         for pre_event in compute_task.pre_events:
             self.schedule_event(
                 pre_event, config, tensor_shape, forward_only, num_microbatches
@@ -332,7 +356,9 @@ class CDCPPScheduler:
         task_type = compute_task.task_desc.type
         chunk_id = compute_task.task_desc.chunk_id
         mb_id = compute_task.task_desc.mb_id
+        # Important
         parallel_state.set_virtual_pipeline_model_parallel_rank(chunk_id)
+
         is_first_stage = parallel_state.is_pipeline_first_stage()
         is_last_stage = parallel_state.is_pipeline_last_stage()
 
@@ -387,13 +413,24 @@ class CDCPPScheduler:
             if is_first_stage:
                 self.input_tensor_grads[(mb_id, chunk_id)] = None
 
+            if self.wgrad_store is not None:
+                self.wgrad_store.finish_collection_wgrad_block()
+
             # disable grad sync for other microbatches
             if self._is_last_microbatch_for_model_chunk(compute_task, num_microbatches):
                 self.disable_grad_sync()
 
         elif task_type == "W" and not forward_only:
-            # TODO: W block
-            raise NotImplementedError()
+            assert self.wgrad_store is not None
+
+            self.wgrad_store.compute_wgrad_block()
+
+            if self._is_last_microbatch_for_model_chunk(compute_task, num_microbatches):
+                # TODO: I guess enable_grad_sync would not enable DP comm here.
+                # So, we need to do it manually.
+                model_chunk = model[chunk_id]
+                assert hasattr(model_chunk, "finish_grad_sync")
+                model_chunk.finish_grad_sync()
 
         for post_event in compute_task.post_events:
             self.schedule_event(
@@ -557,34 +594,45 @@ class CDCPPScheduler:
     def get_forward_backward_func(self):
         return self.forward_backward_func
 
-
     def get_cdc_recv_delay(self) -> int | float:
         return self.cdc_latency
-    
+
     def need_hook_recv_prev(self) -> bool:
         return self.cdc_recv_prev
-    
+
     def need_hook_recv_next(self) -> bool:
         return self.cdc_recv_next
 
-    def send(self, tensor: torch.Tensor, dst: int, group: dist.ProcessGroupNCCL | None = None):
+    def send(
+        self, tensor: torch.Tensor, dst: int, group: dist.ProcessGroupNCCL | None = None
+    ):
         dist.send(tensor, dst, group=group)
-    
-    def isend(self, tensor: torch.Tensor, dst: int, group: dist.ProcessGroupNCCL | None = None) -> dist.Work:
+
+    def isend(
+        self, tensor: torch.Tensor, dst: int, group: dist.ProcessGroupNCCL | None = None
+    ) -> dist.Work:
         return dist.isend(tensor, dst, group=group)
-    
-    def recv(self, tensor: torch.Tensor, src: int, group: dist.ProcessGroupNCCL | None = None):
+
+    def recv(
+        self, tensor: torch.Tensor, src: int, group: dist.ProcessGroupNCCL | None = None
+    ):
         prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
         next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
-        if (src == prev_rank and self.cdc_recv_prev) or (src == next_rank and self.cdc_recv_next):
+        if (src == prev_rank and self.cdc_recv_prev) or (
+            src == next_rank and self.cdc_recv_next
+        ):
             return cdc_comm.irecv(tensor, src, group=group).wait()
         else:
             dist.recv(tensor, src, group=group)
-    
-    def irecv(self, tensor: torch.Tensor, src: int, group: dist.ProcessGroupNCCL | None = None):
+
+    def irecv(
+        self, tensor: torch.Tensor, src: int, group: dist.ProcessGroupNCCL | None = None
+    ):
         prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
         next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
-        if (src == prev_rank and self.cdc_recv_prev) or (src == next_rank and self.cdc_recv_next):
+        if (src == prev_rank and self.cdc_recv_prev) or (
+            src == next_rank and self.cdc_recv_next
+        ):
             return cdc_comm.irecv(tensor, src, group=group)
         else:
             return dist.irecv(tensor, src, group=group)

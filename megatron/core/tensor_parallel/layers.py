@@ -3,13 +3,17 @@
 # Parts of the code here are adapted from PyTorch
 # repo: https://github.com/pytorch/pytorch
 
+import functools
 import os
 import warnings
 from typing import Any, Callable, List, Optional, Tuple
 
+from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
+from megatron.core.pipeline_parallel.cdc_scheduler.wgrad_store import WGradStore, WGradUnit
+from megatron.training.global_vars import get_args
 import torch
 import torch.nn.functional as F
-from torch.cuda.amp import custom_bwd, custom_fwd
+# from torch.cuda.amp import custom_bwd, custom_fwd
 from torch.nn.parameter import Parameter
 
 from megatron.core.model_parallel_config import ModelParallelConfig
@@ -26,6 +30,8 @@ from ..dist_checkpointing.mapping import ShardedStateDict
 from ..transformer.utils import make_sharded_tensors_for_checkpoint
 from ..utils import make_tp_sharded_tensor_for_checkpoint, prepare_input_tensors_for_wgrad_compute
 from .mappings import (
+    _gather_along_first_dim,
+    _reduce_scatter_along_first_dim,
     copy_to_tensor_model_parallel_region,
     gather_from_sequence_parallel_region,
     gather_from_tensor_model_parallel_region,
@@ -41,6 +47,9 @@ try:
     import fused_weight_gradient_mlp_cuda
 except ImportError:
     _grad_accum_fusion_available = False
+
+custom_fwd = functools.partial(torch.amp.custom_fwd, device_type="cuda")
+custom_bwd = functools.partial(torch.amp.custom_bwd, device_type="cuda")
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     'tensor_model_parallel': False,
@@ -286,13 +295,16 @@ class LinearWithFrozenWeight(torch.autograd.Function):
 
     @staticmethod
     @custom_fwd
-    def forward(ctx, input, weight, bias, allreduce_dgrad):
+    def forward(ctx, input, weight, bias, allreduce_dgrad, reduce_scatter_output):
         """Forward with frozen weight."""
         ctx.save_for_backward(weight)
         ctx.allreduce_dgrad = allreduce_dgrad
+        ctx.reduce_scatter_output = reduce_scatter_output
         output = torch.matmul(input, weight.t())
         if bias is not None:
             output = output + bias
+        if reduce_scatter_output:
+            output = _reduce_scatter_along_first_dim(output)
         return output
 
     @staticmethod
@@ -300,13 +312,16 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Backward with frozen weight."""
         (weight,) = ctx.saved_tensors
+        reduce_scatter_output = ctx.reduce_scatter_output
+        if reduce_scatter_output:
+            grad_output = _gather_along_first_dim(grad_output)
         grad_input = grad_output.matmul(weight)
 
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
             torch.distributed.all_reduce(grad_input, group=get_tensor_model_parallel_group())
 
-        return grad_input, None, None, None
+        return grad_input, None, None, None, None
 
 
 def linear_with_frozen_weight(
@@ -319,6 +334,7 @@ def linear_with_frozen_weight(
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: None = None,
     allreduce_dgrad: bool = None,
+    reduce_scatter_output: bool = False,
 ) -> torch.Tensor:
     """Linear layer execution with weight.requires_grad == False.
 
@@ -379,7 +395,7 @@ def linear_with_frozen_weight(
         )
         allreduce_dgrad = async_grad_allreduce
 
-    args = [input, weight, bias, allreduce_dgrad]
+    args = [input, weight, bias, allreduce_dgrad, reduce_scatter_output]
 
     return LinearWithFrozenWeight.apply(*args)
 
@@ -399,6 +415,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         sequence_parallel,
         grad_output_buffer,
         wgrad_deferral_limit,
+        reduce_scatter_output,
     ):
         """Forward."""
         ctx.save_for_backward(input, weight)
@@ -408,6 +425,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         ctx.sequence_parallel = sequence_parallel
         ctx.wgrad_deferral_limit = wgrad_deferral_limit
         ctx.grad_output_buffer = grad_output_buffer
+        ctx.reduce_scatter_output = reduce_scatter_output
 
         if sequence_parallel:
             world_size = get_tensor_model_parallel_world_size()
@@ -425,22 +443,54 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         output = torch.matmul(total_input, weight.t())
         if bias is not None:
             output = output + bias
+        if reduce_scatter_output:
+            output = _reduce_scatter_along_first_dim(output)
         return output
 
     @staticmethod
     @custom_bwd
-    def backward(ctx, grad_output):
+    def backward(ctx, grad_output_):
         """Backward."""
         input, weight = ctx.saved_tensors
         use_bias = ctx.use_bias
         grad_output_buffer = ctx.grad_output_buffer
         wgrad_deferral_limit = ctx.wgrad_deferral_limit
+        reduce_scatter_output = ctx.reduce_scatter_output
+       
+        args = get_args()
+        wgrad_store: Optional[WGradStore] = None
+        # ctx.sequence_parallel determines if input should be AG'd. TODO: is it always the case?
+        # so if sequence parallel is enabled: if ctx.sequence_parallel=True, it's a CPL otherwise it's RPL.
+        if args.enable_cdcpp_scheduler: 
+            cdc_scheduler = get_cdc_pp_scheduler()
+            wgrad_split = cdc_scheduler.wgrad_split
+            if wgrad_split:
+                wgrad_store = cdc_scheduler.get_wgrad_store()
+                assert wgrad_store is not None, "WGradStore is not initialized"                
+                wgrad_store.add_unit_to_last_block(WGradUnit(
+                    is_CPL=ctx.sequence_parallel,
+                    weight=weight,
+                    input_tensor=input,
+                    input_tensor_AG=ctx.sequence_parallel,
+                    grad_output=grad_output_,
+                    grad_output_AG=reduce_scatter_output,
+                    )
+                )
+        
+        if reduce_scatter_output:
+            grad_output = _gather_along_first_dim(grad_output_)
+        else:
+            grad_output = grad_output_
 
         wgrad_compute = True
         if grad_output_buffer is not None:
             if wgrad_deferral_limit == 0 or len(grad_output_buffer) < wgrad_deferral_limit:
                 grad_output_buffer.append(grad_output)
                 wgrad_compute = False
+        
+        if wgrad_store is not None:
+            # crossdc: reusing existing wgrad_compute flag.
+            wgrad_compute = False
 
         if wgrad_compute:
             if ctx.sequence_parallel:
@@ -534,12 +584,12 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             handle.wait()
             # Need to return None's as gradient has to flow for all the input arguments
             # provided during forward
-            return sub_grad_input, grad_weight, grad_bias, None, None, None, None, None
+            return sub_grad_input, grad_weight, grad_bias, None, None, None, None, None, None
 
         if ctx.allreduce_dgrad:
             handle.wait()
 
-        return grad_input, grad_weight, grad_bias, None, None, None, None, None
+        return grad_input, grad_weight, grad_bias, None, None, None, None, None, None
 
 
 def linear_with_grad_accumulation_and_async_allreduce(
@@ -552,6 +602,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
     async_grad_allreduce: Optional[bool] = None,
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: Optional[int] = 0,
+    reduce_scatter_output: Optional[bool] = False,
 ) -> torch.Tensor:
     """Linear layer execution with asynchronous communication and
     gradient accumulation fusion in backprop.
@@ -633,6 +684,7 @@ def linear_with_grad_accumulation_and_async_allreduce(
         sequence_parallel,
         grad_output_buffer,
         wgrad_deferral_limit,
+        reduce_scatter_output,
     ]
 
     if not linear_with_grad_accumulation_and_async_allreduce.warned:
@@ -1130,6 +1182,15 @@ class RowParallelLinear(torch.nn.Module):
             )
         )
 
+        args = get_args()
+        self.reduce_scatter_output_in_RPL_core_func = False
+        if args.enable_cdcpp_scheduler:
+            scheduler = get_cdc_pp_scheduler()
+            if scheduler.wgrad_split:
+                assert args.sequence_parallel, "CDC scheduler now only supports sequence parallelism on"
+                self.reduce_scatter_output_in_RPL_core_func = True
+            
+
     def forward(self, input_):
         """Forward of RowParallelLinear
 
@@ -1170,6 +1231,7 @@ class RowParallelLinear(torch.nn.Module):
             sequence_parallel=False,
             grad_output_buffer=None,
             allreduce_dgrad=allreduce_dgrad,
+            reduce_scatter_output=self.reduce_scatter_output_in_RPL_core_func,
         )
 
         # All-reduce across all the partitions.
@@ -1177,7 +1239,10 @@ class RowParallelLinear(torch.nn.Module):
             assert self.skip_bias_add
             output_ = output_parallel
         elif self.sequence_parallel:
-            output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
+            if self.reduce_scatter_output_in_RPL_core_func:
+                output_ = output_parallel
+            else:
+                output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
         else:
             output_ = reduce_from_tensor_model_parallel_region(output_parallel)
         if not self.skip_bias_add:
