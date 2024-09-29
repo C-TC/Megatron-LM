@@ -591,6 +591,9 @@ class Interleaved1F1BPipeline(Pipeline):
                     mb, dev, task_node_match_condition, seq_ele
                 )
                 if i != 0:
+                    self.microbatch_scheduled_tasks[mb][
+                        -1
+                    ].next_microbatch_task = cur_task
                     cur_task.prev_microbatch_task = self.microbatch_scheduled_tasks[mb][
                         -1
                     ]

@@ -115,7 +115,7 @@ class CDCPPScheduler:
             pp_rank
         ]
 
-        self.cdc_print(f"execution_plan: {self.pp_execution_plan_cur_device}")
+        self.cdc_print(f"execution_plan: \n {self.pp_execution_planner.print_execution_plan()}", rank=0)
 
         self.wgrad_split = any(
             [task.task_desc.type == "W" for task in self.pp_execution_plan_cur_device]
@@ -541,7 +541,6 @@ class CDCPPScheduler:
         first_val_step: bool = None,
     ):
         # self.cdc_print(f'first_stage (virtual): {parallel_state.is_pipeline_first_stage(ignore_virtual=True)} ({parallel_state.is_pipeline_first_stage()}), last_stage (virtual): {parallel_state.is_pipeline_last_stage(ignore_virtual=True)} ({parallel_state.is_pipeline_last_stage()})')
-        self.cdc_print(self.pp_execution_planner.print_execution_plan())
 
         if not forward_only:
             assert num_microbatches == self.pp_schedule.sys_config.num_microbatches
@@ -595,7 +594,7 @@ class CDCPPScheduler:
             )
 
         for compute_task in self.pp_execution_plan_cur_device:
-            self.cdc_print(f"compute_task: {compute_task}")
+            # self.cdc_print(f"compute_task: {compute_task}")
             self.schedule_compute_task(
                 compute_task=compute_task,
                 model=model,
@@ -676,11 +675,13 @@ class CDCPPScheduler:
         else:
             return dist.irecv(tensor, src, group=group)
 
-    def cdc_print(self, msg: str):
+    def cdc_print(self, msg: str, rank=None):
         if not self.cdc_verbose_print:
             return
 
         my_rank = dist.get_rank()
+        if rank is not None and my_rank != rank:
+            return
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         dp_rank = parallel_state.get_data_parallel_rank()

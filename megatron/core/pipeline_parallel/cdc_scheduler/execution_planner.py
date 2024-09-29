@@ -93,6 +93,7 @@ class ExecutionPlanner:
             for dev_task in dev_task_list:
                 prev_mb_task = dev_task.prev_microbatch_task
                 next_mb_task = dev_task.next_microbatch_task
+                # print(f'dev {dev_id}: found next_mb_task {next_mb_task} and prev_mb_task {prev_mb_task}')
                 if prev_mb_task is not None and prev_mb_task.device_id != dev_id:
                     assert prev_mb_task.device_id in [prev_rank, next_rank]
                     if self.pipeline.is_send_to_next_rank(prev_mb_task, dev_task) > 0:
@@ -114,6 +115,11 @@ class ExecutionPlanner:
             # send prev/next lists are already sorted by the task start time
             recv_prev_dev_tasks.sort(key=lambda x: x[0].completion_time)
             recv_next_dev_tasks.sort(key=lambda x: x[0].completion_time)
+            
+            # print(f"Device {dev_id} recv_prev_dev_tasks: {recv_prev_dev_tasks}")
+            # print(f"Device {dev_id} recv_next_dev_tasks: {recv_next_dev_tasks}")
+            # print(f"Device {dev_id} send_prev_dev_tasks: {send_prev_dev_tasks}")
+            # print(f"Device {dev_id} send_next_dev_tasks: {send_next_dev_tasks}")
 
             # insert sends
             for send_task, cur_task in send_prev_dev_tasks:
@@ -245,3 +251,9 @@ class ExecutionPlanner:
             output.append("")
 
         return "\n".join(output)
+
+if '__main__' == __name__:
+    pipeline = get_default_static_schedule(pipeline_name='Interleaved1F1B', num_devices=2, num_microbatches=8)
+    planner = ExecutionPlanner(pipeline)
+    planner.generate_execution_plan()
+    print(planner.print_execution_plan())
