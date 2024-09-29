@@ -467,7 +467,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             if wgrad_split:
                 wgrad_store = cdc_scheduler.get_wgrad_store()
                 assert wgrad_store is not None, "WGradStore is not initialized"                
-                wgrad_store.add_unit_to_last_block(WGradUnit(
+                wgrad_store.add_unit_to_block(WGradUnit(
                     is_CPL=ctx.sequence_parallel,
                     weight=weight,
                     input_tensor=input,

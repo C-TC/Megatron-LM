@@ -733,7 +733,8 @@ class Hanayo1F1BPipeline(Interleaved1F1BPipeline):
         return 0
 
     def get_pipeline_last_stage_rank(self):
-        return 0
+        num_chunks = self.sys_config.num_chunks
+        return 0 if num_chunks % 2 == 0 else self.sys_config.num_devices - 1
 
     def get_pipeline_execution_order(self) -> List[Tuple[int, int]]:
         ret = []
@@ -982,7 +983,7 @@ class ZBH1Pipeline(Pipeline):
         return 0
 
     def get_pipeline_last_stage_rank(self):
-        return 0
+        return self.sys_config.num_devices - 1
 
     def _get_microbatch_sequence(self):
         num_dev = self.sys_config.num_devices
