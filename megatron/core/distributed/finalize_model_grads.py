@@ -127,7 +127,11 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
         config.timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
-    _allreduce_embedding_grads(model, config)
+    from megatron.training.global_vars import get_args
+    args = get_args()
+    if not args.enable_cdcpp_scheduler:
+        # crossdc: TODO: we can skip this since we use rope and decouple weights?
+        _allreduce_embedding_grads(model, config)
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
 

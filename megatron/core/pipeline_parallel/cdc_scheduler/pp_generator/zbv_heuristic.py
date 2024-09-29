@@ -8,7 +8,7 @@ from typing import List, Tuple
 
 import numpy as np
 
-from pipeline_config import SystemConfig
+from .pipeline_config import SystemConfig
 
 @dataclass(eq=True, frozen=True)
 class ScheduledNode:

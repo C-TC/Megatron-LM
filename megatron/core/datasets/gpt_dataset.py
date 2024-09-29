@@ -171,7 +171,8 @@ class GPTDataset(MegatronDataset):
         else:
             text, _ = self._query_document_sample_shuffle_indices(idx)
 
-        text = torch.from_numpy(text).long()
+        # print(f'numpy_version: {numpy.__version__}')
+        text = torch.Tensor(text).long()
         if self.config.add_extra_token_to_sequence:
             tokens = text[:-1].contiguous()
             labels = text[1:].contiguous()

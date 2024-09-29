@@ -61,7 +61,7 @@ def get_num_layers_to_build(config: TransformerConfig) -> int:
         from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
         dev_id = parallel_state.get_pipeline_model_parallel_rank()
         chunk_id = parallel_state.get_virtual_pipeline_model_parallel_rank()
-        return get_cdc_pp_scheduler().get_num_layers_in_chunk(dev_id, chunk_id)        
+        return get_cdc_pp_scheduler().get_num_layers_in_chunk(dev_id=dev_id, chunk_id=chunk_id)        
     
     if config.first_pipeline_num_layers is not None or config.last_pipeline_num_layers is not None:
         assert (

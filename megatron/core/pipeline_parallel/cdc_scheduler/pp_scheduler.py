@@ -52,8 +52,12 @@ class CDCPPScheduler:
 
     def __init__(self, args) -> None:
         self.args = args
+        self.config = None
         self.use_static_schedule = False
         self.pp_schedule: Pipeline = None
+
+        self.cdc_verbose_print = args.cdc_verbose_print
+        self.cdc_print_rank = args.cdc_print_rank
 
         pp_size = args.pipeline_model_parallel_size
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -110,6 +114,8 @@ class CDCPPScheduler:
         self.pp_execution_plan_cur_device: List[ComputeTask] = self.pp_execution_plan[
             pp_rank
         ]
+
+        self.cdc_print(f"execution_plan: {self.pp_execution_plan_cur_device}")
 
         self.wgrad_split = any(
             [task.task_desc.type == "W" for task in self.pp_execution_plan_cur_device]
@@ -172,11 +178,18 @@ class CDCPPScheduler:
             pass
 
         assert (
-            not args.align_grad_reduce and args.grad_sync_func is None
+            not args.align_grad_reduce
         ), "align_grad_reduce is not supported, therefore grad_sync_func must be None"
+        if hasattr(args, "grad_sync_func"):
+            # grad_sync_func may not be set now. No align_grad_reduce should be enough.
+            assert args.grad_sync_func is None
+
         assert (
-            not args.align_param_gather and args.param_sync_func is None
+            not args.align_param_gather
         ), "align_param_gather is not supported, therefore param_sync_func must be None"
+        if hasattr(args, "param_sync_func"):
+            # param_sync_func may not be set now. No align_param_gather should be enough.
+            assert args.param_sync_func is None
 
         assert (
             not args.defer_embedding_wgrad_compute
@@ -192,6 +205,13 @@ class CDCPPScheduler:
                 args.gradient_accumulation_fusion
             ), "W-grad split requires gradient accumulation fusion"
 
+    def update_args_and_config(self, args, config):
+        # Megatron may add/modify attributes in args and config after initialization.
+        self.args = args
+        self.config = config
+        # crossdc: TODO: enable this
+        self.config.deallocate_pipeline_outputs = False
+
     def get_wgrad_store(self):
         return self.wgrad_store
 
@@ -201,21 +221,25 @@ class CDCPPScheduler:
         idx_in_order = execution_order.index((dev_id, chunk_id))
         return sum(layers_list[:idx_in_order])
 
-    def get_num_layers_in_chunk(self, *, dev_id=None, chunk_id=None):
+    def get_num_layers_in_chunk(self, dev_id=None, chunk_id=None):
         # TODO: better model splitting
         # now we treat vocab and lm head as one layer each. and add unbalanced layers to first several chunks
         num_layer = self.args.num_layers
         execution_order = self.pp_schedule.get_pipeline_execution_order()
         total_chunks = len(execution_order)
 
-        head_tail_layers = (num_layer + 2) // total_chunks
-        rest_layers = num_layer - head_tail_layers * 2
-        rest_chunks = total_chunks - 2
-        remainder = rest_layers % rest_chunks
-        layer_list = [rest_layers // rest_chunks] * rest_chunks
-        for i in range(remainder):
-            layer_list[i] += 1
-        layer_list = [head_tail_layers] + layer_list + [head_tail_layers]
+        assert total_chunks >= 2, "CDC scheduler should be enabled with pp >= 2"
+        if total_chunks == 2:
+            layer_list = [num_layer // 2, num_layer - num_layer // 2]
+        else:
+            head_tail_layers = (num_layer + 2) // total_chunks - 1
+            rest_layers = num_layer - head_tail_layers * 2
+            rest_chunks = total_chunks - 2
+            remainder = rest_layers % rest_chunks
+            layer_list = [rest_layers // rest_chunks] * rest_chunks
+            for i in range(remainder):
+                layer_list[i] += 1
+            layer_list = [head_tail_layers] + layer_list + [head_tail_layers]
 
         assert (dev_id is not None or chunk_id is not None) or (
             dev_id is None and chunk_id is None
@@ -273,13 +297,13 @@ class CDCPPScheduler:
             )
         else:
             send_buffer = get_or_set_tensor(
-                self.output_tensor_grads,
+                self.input_tensor_grads,
                 (event.mb_id, event.chunk_id),
                 config,
                 tensor_shape,
             )
             recv_buffer = get_or_set_tensor(
-                self.input_tensor_grads,
+                self.output_tensor_grads,
                 (event.mb_id, event.chunk_id),
                 config,
                 tensor_shape,
@@ -349,6 +373,7 @@ class CDCPPScheduler:
         config = get_model_config(model[0])
 
         for pre_event in compute_task.pre_events:
+            self.cdc_print(f"pre_event: {pre_event}")
             self.schedule_event(
                 pre_event, config, tensor_shape, forward_only, num_microbatches
             )
@@ -363,6 +388,7 @@ class CDCPPScheduler:
         is_last_stage = parallel_state.is_pipeline_last_stage()
 
         if task_type == "F" and (not forward_only or mb_id < num_microbatches):
+            self.cdc_print(f"forward_step mb_id: {mb_id}, chunk_id: {chunk_id}")
             self.output_tensors[(mb_id, chunk_id)], num_tokens = forward_step(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator[chunk_id],
@@ -382,13 +408,15 @@ class CDCPPScheduler:
                 encoder_decoder_xattn=False,
             )
             self.total_num_tokens += num_tokens.item()
-            if is_last_stage:
-                # no need to cache output tensor at last stage
-                self.output_tensors[(mb_id, chunk_id)] = None
+            # The following is buggy. crossdc: TODO: another way to deallocate?
+            # if is_last_stage:
+            #     # no need to cache output tensor at last stage
+            #     self.output_tensors[(mb_id, chunk_id)] = None
 
         elif task_type == "B" and not forward_only:
             # Only training. In eval, we skip backward.
 
+            self.cdc_print(f"backward_step mb_id: {mb_id}, chunk_id: {chunk_id}")
             # enable grad sync for the last microbatch
             if self._is_last_microbatch_for_model_chunk(compute_task, num_microbatches):
                 self.enable_grad_sync()
@@ -423,6 +451,8 @@ class CDCPPScheduler:
         elif task_type == "W" and not forward_only:
             assert self.wgrad_store is not None
 
+            self.cdc_print(f"wgrad_step mb_id: {mb_id}, chunk_id: {chunk_id}")
+
             self.wgrad_store.compute_wgrad_block()
 
             if self._is_last_microbatch_for_model_chunk(compute_task, num_microbatches):
@@ -433,6 +463,7 @@ class CDCPPScheduler:
                 model_chunk.finish_grad_sync()
 
         for post_event in compute_task.post_events:
+            self.cdc_print(f"post_event: {post_event}")
             self.schedule_event(
                 post_event, config, tensor_shape, forward_only, num_microbatches
             )
@@ -441,18 +472,19 @@ class CDCPPScheduler:
         # TODO: any better ways?
 
         # output tensors and input tensor grads
-        for (mb_id, chunk_id, task_type), handle in (
-            self.send_next_reqs.items() + self.send_prev_reqs.items()
-        ):
+        for (mb_id, chunk_id, task_type), handle in list(
+            self.send_next_reqs.items()
+        ) + list(self.send_prev_reqs.items()):
             if task_type == "F":
                 if (
                     self.output_tensors[(mb_id, chunk_id)] is not None
                     and handle is not None
                     and handle.is_completed()
                 ):
+                    self.cdc_print(f"deallocate_output_tensor: {mb_id}, {chunk_id}")
                     deallocate_output_tensor(
                         self.output_tensors[(mb_id, chunk_id)],
-                        self.args.deallocate_pipeline_outputs,
+                        self.config.deallocate_pipeline_outputs,
                     )
             elif task_type == "B":
                 if (
@@ -460,12 +492,14 @@ class CDCPPScheduler:
                     and handle is not None
                     and handle.is_completed()
                 ):
+                    self.cdc_print(f"releasing input grad ref: {mb_id}, {chunk_id}")
                     self.input_tensor_grads[(mb_id, chunk_id)] = None
 
     def setup_grad_sync(self):
         # grad sync
         # Disable async grad reductions
-        self.no_sync_func = self.args.no_sync_func
+        assert self.config is not None
+        self.no_sync_func = self.config.no_sync_func
         # crossdc: chunk based no sync
         if isinstance(self.no_sync_func, list):
 
@@ -506,6 +540,9 @@ class CDCPPScheduler:
         collect_non_loss_data: bool = False,
         first_val_step: bool = None,
     ):
+        # self.cdc_print(f'first_stage (virtual): {parallel_state.is_pipeline_first_stage(ignore_virtual=True)} ({parallel_state.is_pipeline_first_stage()}), last_stage (virtual): {parallel_state.is_pipeline_last_stage(ignore_virtual=True)} ({parallel_state.is_pipeline_last_stage()})')
+        self.cdc_print(self.pp_execution_planner.print_execution_plan())
+
         if not forward_only:
             assert num_microbatches == self.pp_schedule.sys_config.num_microbatches
         else:
@@ -558,6 +595,7 @@ class CDCPPScheduler:
             )
 
         for compute_task in self.pp_execution_plan_cur_device:
+            self.cdc_print(f"compute_task: {compute_task}")
             self.schedule_compute_task(
                 compute_task=compute_task,
                 model=model,
@@ -589,6 +627,7 @@ class CDCPPScheduler:
 
         self.clean_up()
 
+        self.cdc_print(f"forward_data_store: {forward_data_store}")
         return forward_data_store
 
     def get_forward_backward_func(self):
@@ -636,3 +675,16 @@ class CDCPPScheduler:
             return cdc_comm.irecv(tensor, src, group=group)
         else:
             return dist.irecv(tensor, src, group=group)
+
+    def cdc_print(self, msg: str):
+        if not self.cdc_verbose_print:
+            return
+
+        my_rank = dist.get_rank()
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        dp_rank = parallel_state.get_data_parallel_rank()
+        if self.cdc_print_rank == -1 or my_rank == self.cdc_print_rank:
+            print(
+                f"[CDC] Global[{my_rank}] TP[{tp_rank}] PP[{pp_rank}] DP[{dp_rank}]:    {msg}"
+            )

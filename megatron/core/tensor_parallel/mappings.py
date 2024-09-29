@@ -165,7 +165,7 @@ def _reduce_scatter_along_first_dim(input_, input_split_sizes=None):
         dim_size[0] = dim_size[0] // world_size
 
         output = torch.empty(dim_size, dtype=input_.dtype, device=torch.cuda.current_device())
-        torch.distributed._reduce_scatter_base(
+        torch.distributed.reduce_scatter_tensor(
             output, input_.contiguous(), group=get_tensor_model_parallel_group()
         )
     else:

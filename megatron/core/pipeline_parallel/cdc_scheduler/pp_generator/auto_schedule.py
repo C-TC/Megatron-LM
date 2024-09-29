@@ -1,7 +1,7 @@
 import numpy as np
 import psutil
 from typing import Dict, List, Optional, Tuple
-from pipeline import SystemConfig
+from .pipeline_config import SystemConfig
 from pulp import LpVariable, LpProblem, LpMinimize, LpStatus, lpSum, value
 import pulp
 import gurobipy as gp

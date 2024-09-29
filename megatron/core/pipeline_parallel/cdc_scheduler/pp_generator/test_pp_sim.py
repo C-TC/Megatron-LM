@@ -1,9 +1,9 @@
 from typing import Type
 
-from pipeline_config import SystemConfig
-from auto_schedule import UnidirectionalZBDependencyGraph, WaveLikeZBDependencyGraph
-from auto_schedule_store import AutoScheduleStore
-from pipeline import (
+from .pipeline_config import SystemConfig
+from .auto_schedule import UnidirectionalZBDependencyGraph, WaveLikeZBDependencyGraph
+from .auto_schedule_store import AutoScheduleStore
+from .pipeline import (
     AutoUDZBPipeline,
     AutoWaveZBPipeline,
     GpipePipeline,
@@ -18,8 +18,8 @@ from pipeline import (
     Pipeline,
     ZBH1Pipeline,
 )
-from simulator import BFSPPSimCfgGen, SimCfgGen
-from util import generate_comm_mat
+from .simulator import BFSPPSimCfgGen, SimCfgGen
+from .util import generate_comm_mat
 from megatron.core.pipeline_parallel.cdc_scheduler.execution_planner import ExecutionPlanner
 
 

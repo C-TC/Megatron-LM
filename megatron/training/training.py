@@ -9,6 +9,7 @@ import gc
 import logging
 import math
 import os
+import platform
 import sys
 from .log_handler import CustomHandler
 # Make default logging level INFO, but filter out all log messages not from MCore.
@@ -1150,6 +1151,10 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
     config.finalize_model_grads_func = finalize_model_grads
+    
+    if args.enable_cdcpp_scheduler:
+        from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
+        get_cdc_pp_scheduler().update_args_and_config(args, config)
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
@@ -1200,20 +1205,25 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             one_logger.store_set('get_e2e_base_metrics', get_e2e_base_metrics)
 
     if args.profile and torch.distributed.get_rank() in args.profile_ranks and args.use_pytorch_profiler:
+        world_rank = torch.distributed.get_rank()
         prof = torch.profiler.profile(
-        schedule=torch.profiler.schedule(
-            wait=max(args.profile_step_start-1, 0),
-            warmup=1 if args.profile_step_start > 0 else 0,
-            active=args.profile_step_end-args.profile_step_start,
-            repeat=1),
-        on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
-        record_shapes=True,
-        with_stack=True)
+            activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+            schedule=torch.profiler.schedule(
+                wait=max(args.profile_step_start-1, 0),
+                warmup=1 if args.profile_step_start > 0 else 0,
+                active=args.profile_step_end-args.profile_step_start,
+                repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir, worker_name=f'torchprof_{world_rank}'),
+            record_shapes=True,
+            with_stack=True
+        )
         prof.start()
 
     while iteration < args.train_iters:
         if args.profile and torch.distributed.get_rank() in args.profile_ranks:
-            # torch.cuda.memory._record_memory_history()
+            # # check if x86 platform
+            # if 'x86' in platform.machine():
+            #     torch.cuda.memory._record_memory_history()
             if args.use_pytorch_profiler:
                 prof.step()
             elif iteration == args.profile_step_start:
@@ -1426,11 +1436,12 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         if args.profile and \
             iteration == args.profile_step_end and \
             torch.distributed.get_rank() in args.profile_ranks:
-            # torch.cuda.memory._dump_snapshot(f'{args.tensorboard_dir}/rank{torch.distributed.get_rank()}.json')
             if args.use_pytorch_profiler:
                 prof.stop()
             else:
                 torch.cuda.cudart().cudaProfilerStop()
+            # if 'x86' in platform.machine():
+            #     torch.cuda.memory._dump_snapshot(f'{args.tensorboard_dir}/rank{torch.distributed.get_rank()}.json')
 
         if args.manual_gc:
             if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:

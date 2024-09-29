@@ -3,8 +3,8 @@ import os
 import pickle
 from typing import Dict, List
 
-from auto_schedule import UnidirectionalZBDependencyGraph, WaveLikeZBDependencyGraph
-from pipeline_config import SystemConfig
+from .auto_schedule import UnidirectionalZBDependencyGraph, WaveLikeZBDependencyGraph
+from .pipeline_config import SystemConfig
 
 
 @dataclass

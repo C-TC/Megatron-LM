@@ -1,12 +1,12 @@
 from dataclasses import dataclass
 import enum
 from typing import Callable, List, Optional, Tuple
-from pipeline_config import SystemConfig
-from heuristic_schedule import ZBVHeuristicSchedule
-from heuristic_schedule_v2 import ZBVHeuristicScheduleV2
-from zbv_heuristic import OfficialZBVHeuristicScheduler
-from heuristic_ud_schedule import UDHeuristicSchedule, ZBUDHeuristicSchedule
-from svg_event import draw_events, TIME_PER_UNIT
+from .pipeline_config import SystemConfig
+from .heuristic_schedule import ZBVHeuristicSchedule
+from .heuristic_schedule_v2 import ZBVHeuristicScheduleV2
+from .zbv_heuristic import OfficialZBVHeuristicScheduler
+from .heuristic_ud_schedule import UDHeuristicSchedule, ZBUDHeuristicSchedule
+from .svg_event import draw_events, TIME_PER_UNIT
 import os
 
 
@@ -138,6 +138,30 @@ class Pipeline:
     ) -> Tuple[List[Tuple[int, str]], Callable[[TaskNode, Tuple], bool]]:
         raise NotImplementedError("Microbatch sequence not implemented")
 
+    def is_send_to_next_rank(self, prev_task: TaskNode, cur_task: TaskNode):
+        """Helper function to decide if the communication is using send_next & recv_prev process group
+        or send_prev & recv_next process group.
+        Mostly for tie breaking when PP=2.
+
+        Return:
+            1 if send_next & recv_prev
+            0 if on the same device
+            -1 if send_prev & recv_next
+        """
+        prev_dev = prev_task.device_id
+        cur_dev = cur_task.device_id
+        prev_type = prev_task.task_type
+        cur_type = cur_task.task_type
+        if prev_dev == cur_dev:
+            return 0
+        assert prev_type == cur_type
+        if prev_type == "F":
+            return 1
+        elif prev_type == "B":
+            return -1
+        else:
+            raise ValueError("Unreachable")
+
     def _get_execution_time(self, dev: int, task_type: str) -> int:
         if task_type == "F":
             return self.sys_config.T_F[dev]
@@ -239,7 +263,7 @@ class Pipeline:
         raise NotImplementedError()
 
     def get_pipeline_execution_order(self) -> List[Tuple[int, int]]:
-        '''return a list of tuples (device_id, chunk_id)'''
+        """return a list of tuples (device_id, chunk_id)"""
         return [(dev, 0) for dev in range(self.sys_config.num_devices)]
 
     def get_device_scheduled_tasks(self) -> List[List[TaskNode]]:
@@ -748,6 +772,26 @@ class Hanayo1F1BPipeline(Interleaved1F1BPipeline):
 
         return sequence, condition
 
+    def is_send_to_next_rank(
+        self, prev_task: InterleavedTaskNode, cur_task: InterleavedTaskNode
+    ):
+        prev_dev = prev_task.device_id
+        cur_dev = cur_task.device_id
+        prev_type = prev_task.task_type
+        cur_type = cur_task.task_type
+        prev_chunk = prev_task.chunk_id
+        cur_chunk = cur_task.chunk_id
+        if prev_dev == cur_dev:
+            return 0
+        assert prev_type == cur_type
+        assert prev_chunk == cur_chunk
+        if prev_type == "F":
+            return 1 if prev_chunk % 2 == 0 else -1
+        elif prev_type == "B":
+            return 1 if prev_chunk % 2 == 1 else -1
+        else:
+            raise ValueError("Unreachable")
+
     def schedule(self):
         num_dev = self.sys_config.num_devices
         num_mb = self.sys_config.num_microbatches
@@ -1169,6 +1213,26 @@ class AutoWaveZBPipeline(Interleaved1F1BPipeline):
 
         return sequence, condition
 
+    def is_send_to_next_rank(
+        self, prev_task: InterleavedTaskNode, cur_task: InterleavedTaskNode
+    ):
+        prev_dev = prev_task.device_id
+        cur_dev = cur_task.device_id
+        prev_type = prev_task.task_type
+        cur_type = cur_task.task_type
+        prev_chunk = prev_task.chunk_id
+        cur_chunk = cur_task.chunk_id
+        if prev_dev == cur_dev:
+            return 0
+        assert prev_type == cur_type
+        assert prev_chunk == cur_chunk
+        if prev_type == "F":
+            return 1 if prev_chunk % 2 == 0 else -1
+        elif prev_type == "B":
+            return 1 if prev_chunk % 2 == 1 else -1
+        else:
+            raise ValueError("Unreachable")
+
     def schedule(self, schedule: Optional[List[List[Tuple[int, int, int, str, int]]]]):
         num_dev = self.sys_config.num_devices
 
@@ -1253,6 +1317,26 @@ class HeuristicWaveZBPipeline(Interleaved1F1BPipeline):
             )
 
         return sequence, condition
+
+    def is_send_to_next_rank(
+        self, prev_task: InterleavedTaskNode, cur_task: InterleavedTaskNode
+    ):
+        prev_dev = prev_task.device_id
+        cur_dev = cur_task.device_id
+        prev_type = prev_task.task_type
+        cur_type = cur_task.task_type
+        prev_chunk = prev_task.chunk_id
+        cur_chunk = cur_task.chunk_id
+        if prev_dev == cur_dev:
+            return 0
+        assert prev_type == cur_type
+        assert prev_chunk == cur_chunk
+        if prev_type == "F":
+            return 1 if prev_chunk % 2 == 0 else -1
+        elif prev_type == "B":
+            return 1 if prev_chunk % 2 == 1 else -1
+        else:
+            raise ValueError("Unreachable")
 
     def schedule(self):
         self.scheduler.schedule()
@@ -1412,6 +1496,26 @@ class HeuristicZBVPipeline(Interleaved1F1BPipeline):
 
         return sequence, condition
 
+    def is_send_to_next_rank(
+        self, prev_task: InterleavedTaskNode, cur_task: InterleavedTaskNode
+    ):
+        prev_dev = prev_task.device_id
+        cur_dev = cur_task.device_id
+        prev_type = prev_task.task_type
+        cur_type = cur_task.task_type
+        prev_chunk = prev_task.chunk_id
+        cur_chunk = cur_task.chunk_id
+        if prev_dev == cur_dev:
+            return 0
+        assert prev_type == cur_type
+        assert prev_chunk == cur_chunk
+        if prev_type == "F":
+            return 1 if prev_chunk % 2 == 0 else -1
+        elif prev_type == "B":
+            return 1 if prev_chunk % 2 == 1 else -1
+        else:
+            raise ValueError("Unreachable")
+
     def schedule(self):
         schedule = self.scheduler.get_schedule()
 
@@ -1475,16 +1579,21 @@ def get_default_static_schedule(
         M_Limit=num_devices * 2 * 2,
     )
     if pipeline_name == "1F1B":
-        return OneFOneBPipeline(default_cfg)
+        pipeline = OneFOneBPipeline(default_cfg)
     elif pipeline_name == "GPipe":
-        return GpipePipeline(default_cfg)
+        pipeline = GpipePipeline(default_cfg)
     elif pipeline_name == "Interleaved1F1B":
-        return Interleaved1F1BPipeline(iv_1f1b_cfg)
+        pipeline = Interleaved1F1BPipeline(iv_1f1b_cfg)
     elif pipeline_name == "Hanayo":
-        return Hanayo1F1BPipeline(iv_1f1b_cfg)
+        pipeline = Hanayo1F1BPipeline(iv_1f1b_cfg)
     elif pipeline_name == "ZBH1":
-        return ZBH1Pipeline(zbh1_cfg)
+        pipeline = ZBH1Pipeline(zbh1_cfg)
     elif pipeline_name == "ZBV":
-        return HeuristicZBVPipeline(zbv_cfg)
+        pipeline = HeuristicZBVPipeline(zbv_cfg)
     else:
         raise ValueError(f"Pipeline {pipeline_name} not supported")
+
+    pipeline.schedule()
+    pipeline.solve_dependencies()
+
+    return pipeline

@@ -5,11 +5,11 @@ import math
 from typing import Dict, List, Optional, Tuple
 from pulp import LpVariable, LpProblem, LpMinimize, LpStatus, lpSum, value
 
-from model_config import LLAMA_SIZE_TO_CONFIG, CUSTOM_SIZE_TO_CONFIG, LlamaConfig
-from pipeline_config import SystemConfig
-from pipeline import GpipePipeline, Hanayo1F1BPipeline, HeuristicWaveZBPipeline, Interleaved1F1BPipeline, OneFOneBPipeline, TaskNode, InterleavedTaskNode, ZBH1Pipeline
+from .model_config import LLAMA_SIZE_TO_CONFIG, CUSTOM_SIZE_TO_CONFIG, LlamaConfig
+from .pipeline_config import SystemConfig
+from .pipeline import GpipePipeline, Hanayo1F1BPipeline, HeuristicWaveZBPipeline, Interleaved1F1BPipeline, OneFOneBPipeline, TaskNode, InterleavedTaskNode, ZBH1Pipeline
 from util import generate_comm_mat, scale_to_int
-from auto_schedule import gurobi_options
+from .auto_schedule import gurobi_options
 
 import pulp
 import gurobipy as gp

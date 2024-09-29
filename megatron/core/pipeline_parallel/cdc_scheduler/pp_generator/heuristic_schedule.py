@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from functools import cmp_to_key
 import math
 from typing import List, Tuple
-from pipeline import SystemConfig
+from .pipeline_config import SystemConfig
 
 
 @dataclass

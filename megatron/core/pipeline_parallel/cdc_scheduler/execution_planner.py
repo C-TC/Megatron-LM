@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple
 from megatron.core.pipeline_parallel.cdc_scheduler.pp_generator.pipeline import (
     Pipeline,
     TaskNode,
+    get_default_static_schedule,
 )
 
 
@@ -94,16 +95,20 @@ class ExecutionPlanner:
                 next_mb_task = dev_task.next_microbatch_task
                 if prev_mb_task is not None and prev_mb_task.device_id != dev_id:
                     assert prev_mb_task.device_id in [prev_rank, next_rank]
-                    if prev_mb_task.device_id == prev_rank:
+                    if self.pipeline.is_send_to_next_rank(prev_mb_task, dev_task) > 0:
+                        assert prev_mb_task.device_id == prev_rank
                         recv_prev_dev_tasks.append((prev_mb_task, dev_task))
-                    elif prev_mb_task.device_id == next_rank:
+                    elif self.pipeline.is_send_to_next_rank(prev_mb_task, dev_task) < 0:
+                        assert prev_mb_task.device_id == next_rank
                         recv_next_dev_tasks.append((prev_mb_task, dev_task))
                 if next_mb_task is not None and next_mb_task.device_id != dev_id:
                     assert next_mb_task.device_id in [prev_rank, next_rank]
-                    if next_mb_task.device_id == prev_rank:
-                        send_prev_dev_tasks.append((next_mb_task, dev_task))
-                    elif next_mb_task.device_id == next_rank:
+                    if self.pipeline.is_send_to_next_rank(dev_task, next_mb_task) > 0:
+                        assert next_mb_task.device_id == next_rank
                         send_next_dev_tasks.append((next_mb_task, dev_task))
+                    elif self.pipeline.is_send_to_next_rank(dev_task, next_mb_task) < 0:
+                        assert next_mb_task.device_id == prev_rank
+                        send_prev_dev_tasks.append((next_mb_task, dev_task))
 
             # sort the tasks by send time, to avoid deadlock in each of four channels
             # send prev/next lists are already sorted by the task start time
@@ -187,13 +192,24 @@ class ExecutionPlanner:
                 )
 
             # insert wait recvs
-            for recv_task, cur_task in recv_prev_dev_tasks + recv_next_dev_tasks:
+            for recv_task, cur_task in recv_prev_dev_tasks:
                 compute_task = tasknode_to_computetask[cur_task]
                 compute_task.pre_events.append(
                     CommEvent(
-                        type=CommEventType.WAIT_RECV_PREV
-                        if recv_task.device_id == prev_rank
-                        else CommEventType.WAIT_RECV_NEXT,
+                        type=CommEventType.WAIT_RECV_PREV,
+                        src_dev_id=recv_task.device_id,
+                        dst_dev_id=dev_id,
+                        task_type=cur_task.task_type,
+                        chunk_id=tasknode_to_computetask[cur_task].task_desc.chunk_id,
+                        mb_id=cur_task.microbatch_id,
+                    )
+                )
+
+            for recv_task, cur_task in recv_next_dev_tasks:
+                compute_task = tasknode_to_computetask[cur_task]
+                compute_task.pre_events.append(
+                    CommEvent(
+                        type=CommEventType.WAIT_RECV_NEXT,
                         src_dev_id=recv_task.device_id,
                         dst_dev_id=dev_id,
                         task_type=cur_task.task_type,
@@ -204,25 +220,28 @@ class ExecutionPlanner:
 
             # no need to insert wait sends.
 
-    def print_execution_plan(self):
-        print("Execution Plan:")
-        print("=" * 120)
+    def print_execution_plan(self) -> str:
+        output = []
+        output.append("Execution Plan:")
+        output.append("=" * 120)
         for dev_id, dev_task_list in enumerate(self.execution_plan):
-            print()
-            print(f"Device {dev_id}:")
+            output.append("")
+            output.append(f"Device {dev_id}:")
             for task in dev_task_list:
-                print("-" * 60)
-                print("  Prev Events:")
+                output.append("-" * 60)
+                output.append("  Prev Events:")
                 for event in task.pre_events:
-                    print(f"    {event}")
+                    output.append(f"    {event}")
 
-                print("  Compute Task:")
-                print(
+                output.append("  Compute Task:")
+                output.append(
                     f"    {task.task_desc.type} mb{task.task_desc.mb_id} chunk{task.task_desc.chunk_id} start{task.start_time} end{task.end_time}"
                 )
 
-                print("  Post Events:")
+                output.append("  Post Events:")
                 for event in task.post_events:
-                    print(f"    {event}")
-            print("=" * 120)
-            print()
+                    output.append(f"    {event}")
+            output.append("=" * 120)
+            output.append("")
+
+        return "\n".join(output)

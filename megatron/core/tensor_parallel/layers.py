@@ -8,9 +8,6 @@ import os
 import warnings
 from typing import Any, Callable, List, Optional, Tuple
 
-from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
-from megatron.core.pipeline_parallel.cdc_scheduler.wgrad_store import WGradStore, WGradUnit
-from megatron.training.global_vars import get_args
 import torch
 import torch.nn.functional as F
 # from torch.cuda.amp import custom_bwd, custom_fwd
@@ -456,12 +453,15 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         grad_output_buffer = ctx.grad_output_buffer
         wgrad_deferral_limit = ctx.wgrad_deferral_limit
         reduce_scatter_output = ctx.reduce_scatter_output
-       
+        
+        from megatron.training.global_vars import get_args
+        from megatron.core.pipeline_parallel.cdc_scheduler.wgrad_store import WGradStore, WGradUnit
         args = get_args()
         wgrad_store: Optional[WGradStore] = None
         # ctx.sequence_parallel determines if input should be AG'd. TODO: is it always the case?
         # so if sequence parallel is enabled: if ctx.sequence_parallel=True, it's a CPL otherwise it's RPL.
-        if args.enable_cdcpp_scheduler: 
+        if args.enable_cdcpp_scheduler:
+            from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
             cdc_scheduler = get_cdc_pp_scheduler()
             wgrad_split = cdc_scheduler.wgrad_split
             if wgrad_split:
@@ -1182,9 +1182,11 @@ class RowParallelLinear(torch.nn.Module):
             )
         )
 
+        from megatron.training.global_vars import get_args
         args = get_args()
         self.reduce_scatter_output_in_RPL_core_func = False
         if args.enable_cdcpp_scheduler:
+            from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
             scheduler = get_cdc_pp_scheduler()
             if scheduler.wgrad_split:
                 assert args.sequence_parallel, "CDC scheduler now only supports sequence parallelism on"

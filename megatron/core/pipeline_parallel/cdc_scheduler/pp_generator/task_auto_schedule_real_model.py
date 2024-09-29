@@ -3,10 +3,10 @@ import sys
 import traceback
 from typing import List, Tuple
 
-from auto_schedule_store import AutoScheduleStore
-from pipeline_config import SystemConfig
-from simulator import SimCfgGen
-from util import generate_comm_mat
+from .auto_schedule_store import AutoScheduleStore
+from .pipeline_config import SystemConfig
+from .simulator import SimCfgGen
+from .util import generate_comm_mat
 
 '''
 TODO: testing and cleanup

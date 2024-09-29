@@ -754,6 +754,9 @@ def initialize_model_parallel(
     global _POSITION_EMBEDDING_GROUP
     global _POSITION_EMBEDDING_GLOBAL_RANKS
     assert _POSITION_EMBEDDING_GROUP is None, 'position embedding group is already initialized'
+    global _PIPELINE_EXTRA_GROUP
+    global _PIPELINE_EXTRA_GLOBAL_RANKS
+    assert _PIPELINE_EXTRA_GROUP is None, 'extra pipeline group is already initialized'
     for ranks in generator_wrapper('pp'):
         group = torch.distributed.new_group(
             ranks, timeout=timeout, pg_options=get_nccl_options('pp', nccl_comm_cfgs)
@@ -769,19 +772,22 @@ def initialize_model_parallel(
                 _PIPELINE_MODEL_PARALLEL_GROUP = [_PIPELINE_MODEL_PARALLEL_GROUP, group]
                 _PIPELINE_GLOBAL_RANKS = [_PIPELINE_GLOBAL_RANKS, ranks]
         
-        # cdcpp groups
-        for i in range(4):
-            extra_group = torch.distributed.new_group(
-                ranks, timeout=timeout, pg_options=get_nccl_options('pp', nccl_comm_cfgs)
-            )
-            if rank in ranks:
-                if _PIPELINE_EXTRA_GROUP is None:
-                    _PIPELINE_EXTRA_GROUP = [extra_group,]
-                    _PIPELINE_EXTRA_GLOBAL_RANKS = [ranks,]
-                else:
-                    _PIPELINE_EXTRA_GROUP = _PIPELINE_EXTRA_GROUP.append(extra_group)
-                    _PIPELINE_EXTRA_GLOBAL_RANKS = _PIPELINE_EXTRA_GLOBAL_RANKS.append(ranks)                   
+        from megatron.training.global_vars import get_args
+        args = get_args()
+        if args.enable_cdcpp_scheduler:
+            for _ in range(4):
+                extra_group = torch.distributed.new_group(
+                    ranks, timeout=timeout, pg_options=get_nccl_options('pp', nccl_comm_cfgs)
+                )
+                if rank in ranks:
+                    if _PIPELINE_EXTRA_GROUP is None:
+                        _PIPELINE_EXTRA_GROUP = [extra_group,]
+                        _PIPELINE_EXTRA_GLOBAL_RANKS = [ranks,]
+                    else:
+                        _PIPELINE_EXTRA_GROUP.append(extra_group)
+                        _PIPELINE_EXTRA_GLOBAL_RANKS.append(ranks)                   
 
+    for ranks in generator_wrapper('pp'):
         embedding_ranks = get_embedding_ranks(ranks)
         group = torch.distributed.new_group(
             embedding_ranks, timeout=timeout, pg_options=get_nccl_options('embd', nccl_comm_cfgs)
@@ -1274,7 +1280,8 @@ def is_pipeline_first_stage(ignore_virtual=False):
 
 
 def is_pipeline_last_stage(ignore_virtual=False):
-    """Return True if in the last pipeline-model-parallel stage, False otherwise."""
+    """Return True if in the last pipeline-model-parallel stage, False otherwise.
+    crossdc: Warining! When ignore_virtual is True, it will return True if current device contains loss!"""
     from megatron.training.global_vars import get_args
     args = get_args()
     
@@ -1789,36 +1796,40 @@ def _initialize_pp_extra_groups_communicators():
     P2P communicator initialzation is lazy and somehow, blocking.
     We initialize eagerly here to avoid deadlocks.   
     """
+    
+    from megatron.training.global_vars import get_args
+    args = get_args()
+    if not args.enable_cdcpp_scheduler:
+        return
+    
+    from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
+    from megatron.core.pipeline_parallel.cdc_scheduler import cdc_comm
     pgs = get_pipeline_extra_groups()
     prev_ranks = get_pipeline_extra_groups_prev_rank()
     next_ranks = get_pipeline_extra_groups_next_rank()
-    ranks = get_pipeline_extra_rank()
+    cur_rank = get_pipeline_extra_rank()
     
-    assert len(pgs) == len(prev_ranks) == len(next_ranks) == len(ranks) == 4
+    assert len(pgs) == len(prev_ranks) == len(next_ranks) == 4
     assert get_pipeline_model_parallel_world_size() % 2 == 0
-    
-    from megatron.training.global_vars import get_args
-    from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
-    from megatron.core.pipeline_parallel.cdc_scheduler import cdc_comm
-    args = get_args()
     send_impl = dist.send
     recv_impl = dist.recv
-    if args.enable_cdcpp_scheduler:
-        cdc_scheduler = get_cdc_pp_scheduler()
-        send_impl = cdc_scheduler.send
-        recv_impl = cdc_scheduler.recv
-        if cdc_scheduler.need_hook_recv_next():
-            recv_next_pg = get_pipeline_extra_recv_next_group()
-            recv_next_pg._register_on_completion_hook(cdc_comm.cdc_comm_completion_hook)
-        elif cdc_scheduler.need_hook_recv_prev():
-            recv_prev_pg = get_pipeline_extra_recv_prev_group()
-            recv_prev_pg._register_on_completion_hook(cdc_comm.cdc_comm_completion_hook)
+    cdc_scheduler = get_cdc_pp_scheduler()
+    send_impl = cdc_scheduler.send
+    recv_impl = cdc_scheduler.recv
+    if cdc_scheduler.need_hook_recv_next():
+        recv_next_pg = get_pipeline_extra_recv_next_group()
+        recv_next_pg._register_on_completion_hook(cdc_comm.cdc_comm_completion_hook)
+    elif cdc_scheduler.need_hook_recv_prev():
+        recv_prev_pg = get_pipeline_extra_recv_prev_group()
+        recv_prev_pg._register_on_completion_hook(cdc_comm.cdc_comm_completion_hook)
 
     # Initialize the communicators (blocking).
-    for pg, prev_rank, next_rank, rank in zip(pgs, prev_ranks, next_ranks, ranks):
-        if rank % 2 == 0:
-            send_impl.send(torch.tensor([1]), dst=next_rank, group=pg)
-            recv_impl.recv(torch.tensor([1]), src=prev_rank, group=pg)
+    for pg, prev_rank, next_rank in zip(pgs, prev_ranks, next_ranks):
+        send_dummy_tensor = torch.tensor([1], device=torch.cuda.current_device())
+        recv_dummy_tensor = torch.tensor([1], device=torch.cuda.current_device())
+        if cur_rank % 2 == 0:
+            send_impl(send_dummy_tensor, dst=next_rank, group=pg)
+            recv_impl(recv_dummy_tensor, src=prev_rank, group=pg)
         else:
-            recv_impl.recv(torch.tensor([1]), src=prev_rank, group=pg)
-            send_impl.send(torch.tensor([1]), dst=next_rank, group=pg)
+            recv_impl(recv_dummy_tensor, src=prev_rank, group=pg)
+            send_impl(send_dummy_tensor, dst=next_rank, group=pg)

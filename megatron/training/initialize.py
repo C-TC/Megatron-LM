@@ -4,6 +4,7 @@
 import logging
 import random
 import os
+import warnings
 import packaging
 import packaging.version
 import time
@@ -223,6 +224,17 @@ def _initialize_tp_communicators():
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
     """Initialize torch.distributed and core model parallel."""
     args = get_args()
+    
+    if args.rank == 0:       
+        warnings.filterwarnings("once", category=Warning) 
+        warnings.filterwarnings("once", category=UserWarning)
+        warnings.filterwarnings("once", category=DeprecationWarning)
+        warnings.filterwarnings("once", category=FutureWarning)
+    else:
+        warnings.filterwarnings("ignore", category=Warning)
+        warnings.filterwarnings("ignore", category=UserWarning)
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        warnings.filterwarnings("ignore", category=FutureWarning)
 
     device_count = torch.cuda.device_count()
     if torch.distributed.is_initialized():

@@ -6,7 +6,6 @@ from torch.distributed import ProcessGroupNCCL
 import torch.distributed as dist
 from torch._C._distributed_c10d import OpType
 from megatron.core import parallel_state
-from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
 
 
 '''
@@ -45,6 +44,7 @@ def cdc_comm_completion_hook(work_info: torch._C._distributed_c10d.WorkInfo):
     if op_type != OpType.RECV:
         return
     
+    from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
     delay_in_seconds = get_cdc_pp_scheduler().get_cdc_recv_delay()
     precise_stall(delay_in_seconds)
     

@@ -1506,6 +1506,9 @@ def _add_distributed_args(parser):
     group.add_argument('--enable_cdcpp_scheduler', action='store_true', default=False,)
     group.add_argument('--static_schedule', type=str, default=None, choices=['1F1B', 'GPipe','Interleaved1F1B','Hanayo','ZBH1','ZBV',])
     
+    group.add_argument('--cdc_verbose_print', action='store_true', default=False, help='CDC verbose message for debugging')
+    group.add_argument('--cdc_print_rank', type=int, default=-1, help='CDC print rank, -1 means all ranks')
+
     group.add_argument('--num_dc', type=int, default=1, help='Number of datacenters')
     group.add_argument('--pp_stages_per_dc', type=int, nargs='+', default=[], help='Number of pipeline stages in each datacenter, e.g 2 2')
     group.add_argument('--cdc_latency', type=int, default=0, help='Latency between datacenters')

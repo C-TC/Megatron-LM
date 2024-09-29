@@ -17,7 +17,6 @@ from megatron.core.utils import (
     get_model_type,
     get_model_xattn,
 )
-from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
 
 # Types
 Shape = Union[List[int], torch.Size]
@@ -106,6 +105,7 @@ def get_forward_backward_func():
         from megatron.training import get_args
         args = get_args()
         if args.enable_cdcpp_scheduler:
+            from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
             return get_cdc_pp_scheduler().get_forward_backward_func()
         if parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None:
             forward_backward_func = forward_backward_pipelining_with_interleaving
