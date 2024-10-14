@@ -71,6 +71,19 @@ class CDCPPScheduler:
         else:
             raise NotImplementedError()
 
+        self.pp_execution_planner = ExecutionPlanner(self.pp_schedule)
+        self.pp_execution_planner.generate_execution_plan()
+        self.pp_execution_plan: List[List[ComputeTask]] = (
+            self.pp_execution_planner.execution_plan
+        )
+
+        self.pp_execution_plan_cur_device: List[ComputeTask] = self.pp_execution_plan[
+            pp_rank
+        ]
+
+        self.cdc_print(f"execution_plan: \n {self.pp_execution_planner.print_execution_plan()}", rank=0)
+        
+        
         # cross-DC
         self.num_dc = args.num_dc
         self.cdc_latency = args.cdc_latency
@@ -89,33 +102,32 @@ class CDCPPScheduler:
             elif len(self.pp_stages_per_dc) == 1:
                 self.pp_stages_per_dc = [self.pp_stages_per_dc[0]] * self.num_dc
             assert sum(self.pp_stages_per_dc) == pp_size
-            assert any(
-                [stages > 1 for stages in self.pp_stages_per_dc]
-            ), "CDC requires at least one stage per DC due to limitation in cdc comm"
+            # assert any(
+            #     [stages > 1 for stages in self.pp_stages_per_dc]
+            # ), "CDC requires at least one stage per DC due to limitation in cdc comm"
 
             # check if ocurrent rank on the boundary of DCs
             dc_boundaries = [
                 sum(self.pp_stages_per_dc[:i]) for i in range(1, self.num_dc)
             ]
             if pp_rank + 1 in dc_boundaries:
-                self.cdc_recv_next = True
+                # check if any recv next events in the plan
+                for task in self.pp_execution_plan_cur_device:
+                    for event in task.pre_events + task.post_events:
+                        if isinstance(event, CommEvent) and event.type == CommEventType.POST_RECV_NEXT:
+                            self.cdc_recv_next = True
+                            break
             if pp_rank in [(x + 1) % pp_size for x in dc_boundaries]:
-                self.cdc_recv_prev = True
+                # check if any recv prev events in the plan
+                for task in self.pp_execution_plan_cur_device:
+                    for event in task.pre_events + task.post_events:
+                        if isinstance(event, CommEvent) and event.type == CommEventType.POST_RECV_PREV:
+                            self.cdc_recv_prev = True
+                            break
             assert not (
                 self.cdc_recv_prev and self.cdc_recv_next
-            ), "CDC recv cannot be both prev and next"
-
-        self.pp_execution_planner = ExecutionPlanner(self.pp_schedule)
-        self.pp_execution_planner.generate_execution_plan()
-        self.pp_execution_plan: List[List[ComputeTask]] = (
-            self.pp_execution_planner.execution_plan
-        )
-
-        self.pp_execution_plan_cur_device: List[ComputeTask] = self.pp_execution_plan[
-            pp_rank
-        ]
-
-        self.cdc_print(f"execution_plan: \n {self.pp_execution_planner.print_execution_plan()}", rank=0)
+            ), "CDC recv cannot be both prev and next since limited info in WorkInfo."
+        
 
         self.wgrad_split = any(
             [task.task_desc.type == "W" for task in self.pp_execution_plan_cur_device]
@@ -656,8 +668,10 @@ class CDCPPScheduler:
     ):
         prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
         next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
-        if (src == prev_rank and self.cdc_recv_prev) or (
-            src == next_rank and self.cdc_recv_next
+        recv_prev_group = parallel_state.get_pipeline_extra_recv_prev_group()
+        recv_next_group = parallel_state.get_pipeline_extra_recv_next_group()
+        if (src == prev_rank and self.cdc_recv_prev and group is recv_prev_group) or (
+            src == next_rank and self.cdc_recv_next and group is recv_next_group
         ):
             return cdc_comm.irecv(tensor, src, group=group).wait()
         else:
@@ -668,8 +682,10 @@ class CDCPPScheduler:
     ):
         prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
         next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
-        if (src == prev_rank and self.cdc_recv_prev) or (
-            src == next_rank and self.cdc_recv_next
+        recv_prev_group = parallel_state.get_pipeline_extra_recv_prev_group()
+        recv_next_group = parallel_state.get_pipeline_extra_recv_next_group()
+        if (src == prev_rank and self.cdc_recv_prev and group is recv_prev_group) or (
+            src == next_rank and self.cdc_recv_next and group is recv_next_group
         ):
             return cdc_comm.irecv(tensor, src, group=group)
         else:
