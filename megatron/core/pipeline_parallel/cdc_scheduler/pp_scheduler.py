@@ -1,5 +1,6 @@
 import contextlib
 from typing import Dict, Iterator, List, Tuple, Union
+from datetime import timedelta
 
 from megatron.core.pipeline_parallel.cdc_scheduler.wgrad_store import WGradStore
 import torch
@@ -28,7 +29,6 @@ from megatron.core.pipeline_parallel.cdc_scheduler.execution_planner import (
     ExecutionPlanner,
     TaskEvent,
 )
-import megatron.core.pipeline_parallel.cdc_scheduler.cdc_comm as cdc_comm
 
 
 _CDC_PP_SCHEDULER = None
@@ -81,14 +81,16 @@ class CDCPPScheduler:
             pp_rank
         ]
 
-        self.cdc_print(f"execution_plan: \n {self.pp_execution_planner.print_execution_plan()}", rank=0)
-        
-        
+        self.cdc_print(
+            f"execution_plan: \n {self.pp_execution_planner.print_execution_plan()}",
+            rank=0,
+        )
+
         # cross-DC
         self.num_dc = args.num_dc
         self.cdc_latency = args.cdc_latency
 
-        # decide whether to insert hooks in PGs.
+        # decide whether to insert latency.
         self.cdc_recv_prev = False
         self.cdc_recv_next = False
 
@@ -102,32 +104,37 @@ class CDCPPScheduler:
             elif len(self.pp_stages_per_dc) == 1:
                 self.pp_stages_per_dc = [self.pp_stages_per_dc[0]] * self.num_dc
             assert sum(self.pp_stages_per_dc) == pp_size
-            # assert any(
-            #     [stages > 1 for stages in self.pp_stages_per_dc]
-            # ), "CDC requires at least one stage per DC due to limitation in cdc comm"
 
             # check if ocurrent rank on the boundary of DCs
             dc_boundaries = [
-                sum(self.pp_stages_per_dc[:i]) for i in range(1, self.num_dc)
+                sum(self.pp_stages_per_dc[:i]) for i in range(1, self.num_dc + 1)
             ]
             if pp_rank + 1 in dc_boundaries:
                 # check if any recv next events in the plan
                 for task in self.pp_execution_plan_cur_device:
                     for event in task.pre_events + task.post_events:
-                        if isinstance(event, CommEvent) and event.type == CommEventType.POST_RECV_NEXT:
+                        if (
+                            isinstance(event, CommEvent)
+                            and event.type == CommEventType.POST_RECV_NEXT
+                        ):
                             self.cdc_recv_next = True
                             break
-            if pp_rank in [(x + 1) % pp_size for x in dc_boundaries]:
+            if pp_rank in [x % pp_size for x in dc_boundaries]:
                 # check if any recv prev events in the plan
                 for task in self.pp_execution_plan_cur_device:
                     for event in task.pre_events + task.post_events:
-                        if isinstance(event, CommEvent) and event.type == CommEventType.POST_RECV_PREV:
+                        if (
+                            isinstance(event, CommEvent)
+                            and event.type == CommEventType.POST_RECV_PREV
+                        ):
                             self.cdc_recv_prev = True
                             break
             assert not (
                 self.cdc_recv_prev and self.cdc_recv_next
             ), "CDC recv cannot be both prev and next since limited info in WorkInfo."
-        
+            self.cdc_print(
+                f"cdc_recv_prev: {self.cdc_recv_prev}, cdc_recv_next: {self.cdc_recv_next}"
+            )
 
         self.wgrad_split = any(
             [task.task_desc.type == "W" for task in self.pp_execution_plan_cur_device]
@@ -344,7 +351,13 @@ class CDCPPScheduler:
         elif event.type == CommEventType.WAIT_RECV_NEXT:
             handle = self.recv_next_reqs[(event.mb_id, event.chunk_id, event.task_type)]
             assert handle is not None
-            handle.wait()
+            if self.cdc_recv_next:
+                assert hasattr(
+                    handle, "wait_with_delay_in_ms"
+                ), "Latency injection requires custom pytorch build for wait_with_delay_in_ms"
+                handle.wait_with_delay_in_ms(timedelta(milliseconds=self.cdc_latency))
+            else:
+                handle.wait()
         elif event.type == CommEventType.WAIT_SEND_PREV:
             handle = self.send_prev_reqs[(event.mb_id, event.chunk_id, event.task_type)]
             assert handle is not None
@@ -352,7 +365,13 @@ class CDCPPScheduler:
         elif event.type == CommEventType.WAIT_RECV_PREV:
             handle = self.recv_prev_reqs[(event.mb_id, event.chunk_id, event.task_type)]
             assert handle is not None
-            handle.wait()
+            if self.cdc_recv_prev:
+                assert hasattr(
+                    handle, "wait_with_delay_in_ms"
+                ), "Latency injection requires custom pytorch build for wait_with_delay_in_ms"
+                handle.wait_with_delay_in_ms(timedelta(milliseconds=self.cdc_latency))
+            else:
+                handle.wait()
         else:
             raise NotImplementedError()
 
@@ -647,12 +666,6 @@ class CDCPPScheduler:
     def get_cdc_recv_delay(self) -> int | float:
         return self.cdc_latency
 
-    def need_hook_recv_prev(self) -> bool:
-        return self.cdc_recv_prev
-
-    def need_hook_recv_next(self) -> bool:
-        return self.cdc_recv_next
-
     def send(
         self, tensor: torch.Tensor, dst: int, group: dist.ProcessGroupNCCL | None = None
     ):
@@ -673,23 +686,18 @@ class CDCPPScheduler:
         if (src == prev_rank and self.cdc_recv_prev and group is recv_prev_group) or (
             src == next_rank and self.cdc_recv_next and group is recv_next_group
         ):
-            return cdc_comm.irecv(tensor, src, group=group).wait()
+            work = dist.irecv(tensor, src, group=group)
+            assert hasattr(
+                work, "wait_with_delay_in_ms"
+            ), "Latency injection requires custom pytorch build for wait_with_delay_in_ms"
+            work.wait_with_delay_in_ms(timedelta(milliseconds=self.cdc_latency))
         else:
             dist.recv(tensor, src, group=group)
 
     def irecv(
         self, tensor: torch.Tensor, src: int, group: dist.ProcessGroupNCCL | None = None
     ):
-        prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
-        next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
-        recv_prev_group = parallel_state.get_pipeline_extra_recv_prev_group()
-        recv_next_group = parallel_state.get_pipeline_extra_recv_next_group()
-        if (src == prev_rank and self.cdc_recv_prev and group is recv_prev_group) or (
-            src == next_rank and self.cdc_recv_next and group is recv_next_group
-        ):
-            return cdc_comm.irecv(tensor, src, group=group)
-        else:
-            return dist.irecv(tensor, src, group=group)
+        return dist.irecv(tensor, src, group=group)
 
     def cdc_print(self, msg: str, rank=None):
         if not self.cdc_verbose_print:

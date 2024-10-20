@@ -1511,7 +1511,7 @@ def _add_distributed_args(parser):
 
     group.add_argument('--num_dc', type=int, default=1, help='Number of datacenters')
     group.add_argument('--pp_stages_per_dc', type=int, nargs='+', default=[], help='Number of pipeline stages in each datacenter, e.g 2 2')
-    group.add_argument('--cdc_latency', type=int, default=0, help='Latency between datacenters')
+    group.add_argument('--cdc_latency', type=int, default=0, help='Latency in ms between datacenters')
 
 
     group.add_argument('--tensor-model-parallel-size', type=int, default=1,

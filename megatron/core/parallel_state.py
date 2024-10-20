@@ -1803,7 +1803,6 @@ def _initialize_pp_extra_groups_communicators():
         return
     
     from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
-    from megatron.core.pipeline_parallel.cdc_scheduler import cdc_comm
     pgs = get_pipeline_extra_groups()
     prev_ranks = get_pipeline_extra_groups_prev_rank()
     next_ranks = get_pipeline_extra_groups_next_rank()
@@ -1811,25 +1810,30 @@ def _initialize_pp_extra_groups_communicators():
     
     assert len(pgs) == len(prev_ranks) == len(next_ranks) == 4
     assert get_pipeline_model_parallel_world_size() % 2 == 0
-    send_impl = dist.send
-    recv_impl = dist.recv
     cdc_scheduler = get_cdc_pp_scheduler()
     send_impl = cdc_scheduler.send
     recv_impl = cdc_scheduler.recv
-    if cdc_scheduler.need_hook_recv_next():
-        recv_next_pg = get_pipeline_extra_recv_next_group()
-        recv_next_pg._register_on_completion_hook(cdc_comm.cdc_comm_completion_hook)
-    elif cdc_scheduler.need_hook_recv_prev():
-        recv_prev_pg = get_pipeline_extra_recv_prev_group()
-        recv_prev_pg._register_on_completion_hook(cdc_comm.cdc_comm_completion_hook)
 
     # Initialize the communicators (blocking).
-    for pg, prev_rank, next_rank in zip(pgs, prev_ranks, next_ranks):
-        send_dummy_tensor = torch.tensor([1], device=torch.cuda.current_device())
-        recv_dummy_tensor = torch.tensor([1], device=torch.cuda.current_device())
-        if cur_rank % 2 == 0:
-            send_impl(send_dummy_tensor, dst=next_rank, group=pg)
-            recv_impl(recv_dummy_tensor, src=prev_rank, group=pg)
-        else:
-            recv_impl(recv_dummy_tensor, src=prev_rank, group=pg)
-            send_impl(send_dummy_tensor, dst=next_rank, group=pg)
+    send_dummy_tensor = torch.tensor([1], device=torch.cuda.current_device())
+    recv_dummy_tensor = torch.tensor([1], device=torch.cuda.current_device())
+    prev_rank = prev_ranks[0]
+    next_rank = next_ranks[0]
+    '''
+                 pg0 pg2 pg0 pg2
+                 --> --> --> -->
+    pp stage:   0   1   2   3   0
+                 <-- <-- <-- <--
+                 pg1 pg3 pg1 pg3
+    '''
+    if cur_rank % 2 == 0:
+        send_impl(send_dummy_tensor, next_rank, get_pipeline_extra_send_next_group())
+        recv_impl(recv_dummy_tensor, next_rank, get_pipeline_extra_recv_next_group())
+        recv_impl(recv_dummy_tensor, prev_rank, get_pipeline_extra_recv_prev_group())
+        send_impl(send_dummy_tensor, prev_rank, get_pipeline_extra_send_prev_group())
+    else:
+        recv_impl(recv_dummy_tensor, prev_rank, get_pipeline_extra_recv_prev_group())
+        send_impl(send_dummy_tensor, prev_rank, get_pipeline_extra_send_prev_group())
+        send_impl(send_dummy_tensor, next_rank, get_pipeline_extra_send_next_group())
+        recv_impl(recv_dummy_tensor, next_rank, get_pipeline_extra_recv_next_group())
+    
