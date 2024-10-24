@@ -23,6 +23,7 @@ class CommEventType(Enum):
     WAIT_RECV_NEXT = auto()
     WAIT_SEND_PREV = auto()
     WAIT_RECV_PREV = auto()
+    LOCAL_COPY = auto()
 
 
 @dataclass
@@ -33,6 +34,7 @@ class CommEvent(TaskEvent):
     task_type: str
     chunk_id: int
     mb_id: int
+    prev_task_chunk_id: int = -1  # only used for local copy
 
 
 @dataclass
@@ -88,12 +90,20 @@ class ExecutionPlanner:
             recv_next_dev_tasks: List[Tuple[TaskNode, TaskNode]] = []
             send_prev_dev_tasks: List[Tuple[TaskNode, TaskNode]] = []
             send_next_dev_tasks: List[Tuple[TaskNode, TaskNode]] = []
+            local_copy_tasks: List[Tuple[TaskNode, TaskNode]] = []
+
             next_rank = (dev_id + 1) % pp_size
             prev_rank = (dev_id - 1 + pp_size) % pp_size
             for dev_task in dev_task_list:
                 prev_mb_task = dev_task.prev_microbatch_task
                 next_mb_task = dev_task.next_microbatch_task
                 # print(f'dev {dev_id}: found next_mb_task {next_mb_task} and prev_mb_task {prev_mb_task}')
+                if prev_mb_task is not None and prev_mb_task.device_id == dev_id:
+                    # local copy
+                    # F chunk 0 -> F chunk 1 or B chunk 1 -> B chunk 0
+                    if prev_mb_task.task_type == dev_task.task_type:
+                        local_copy_tasks.append((prev_mb_task, dev_task))
+
                 if prev_mb_task is not None and prev_mb_task.device_id != dev_id:
                     assert prev_mb_task.device_id in [prev_rank, next_rank]
                     if self.pipeline.is_send_to_next_rank(prev_mb_task, dev_task) > 0:
@@ -115,11 +125,35 @@ class ExecutionPlanner:
             # send prev/next lists are already sorted by the task start time
             recv_prev_dev_tasks.sort(key=lambda x: x[0].completion_time)
             recv_next_dev_tasks.sort(key=lambda x: x[0].completion_time)
-            
+
             # print(f"Device {dev_id} recv_prev_dev_tasks: {recv_prev_dev_tasks}")
             # print(f"Device {dev_id} recv_next_dev_tasks: {recv_next_dev_tasks}")
             # print(f"Device {dev_id} send_prev_dev_tasks: {send_prev_dev_tasks}")
             # print(f"Device {dev_id} send_next_dev_tasks: {send_next_dev_tasks}")
+
+            # insert local copies
+            for prev_mb_task, cur_task in local_copy_tasks:
+                compute_task = tasknode_to_computetask[cur_task]
+                assert prev_mb_task.device_id == dev_id
+                assert prev_mb_task.task_type == cur_task.task_type
+                assert prev_mb_task.microbatch_id == cur_task.microbatch_id
+                assert (
+                    tasknode_to_computetask[prev_mb_task].task_desc.chunk_id
+                    != tasknode_to_computetask[cur_task].task_desc.chunk_id
+                )
+                compute_task.pre_events.append(
+                    CommEvent(
+                        type=CommEventType.LOCAL_COPY,
+                        src_dev_id=dev_id,
+                        dst_dev_id=dev_id,
+                        task_type=cur_task.task_type,
+                        chunk_id=tasknode_to_computetask[cur_task].task_desc.chunk_id,
+                        mb_id=cur_task.microbatch_id,
+                        prev_task_chunk_id=tasknode_to_computetask[
+                            prev_mb_task
+                        ].task_desc.chunk_id,
+                    )
+                )
 
             # insert sends
             for send_task, cur_task in send_prev_dev_tasks:
@@ -252,8 +286,11 @@ class ExecutionPlanner:
 
         return "\n".join(output)
 
-if '__main__' == __name__:
-    pipeline = get_default_static_schedule(pipeline_name='Interleaved1F1B', num_devices=2, num_microbatches=8)
+
+if "__main__" == __name__:
+    pipeline = get_default_static_schedule(
+        pipeline_name="Interleaved1F1B", num_devices=2, num_microbatches=8
+    )
     planner = ExecutionPlanner(pipeline)
     planner.generate_execution_plan()
     print(planner.print_execution_plan())

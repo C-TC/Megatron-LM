@@ -799,6 +799,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, decoupled_learning_r
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
+    
+    # crossdc: TODO: only last PP rank has writer, so data is not correctly logged for schedules like zbv
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'

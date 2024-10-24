@@ -275,6 +275,7 @@ class Pipeline:
         save: bool = False,
         time_range: int = 0,
         include_info: bool = True,
+        save_path: str = None,
     ):
         global TIME_PER_UNIT
         if time_range > 0:
@@ -299,9 +300,12 @@ class Pipeline:
         ]
 
         pipe_name = name if name is not None else self.pipeline_name()
-        path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), f"{pipe_name}.svg"
+        svg_save_path = (
+            save_path
+            if save_path is not None
+            else os.path.dirname(os.path.abspath(__file__))
         )
+        path = os.path.join(svg_save_path, f"{pipe_name}.svg")
         d = draw_events(
             events,
             path,

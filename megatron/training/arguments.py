@@ -1504,14 +1504,22 @@ def _add_distributed_args(parser):
     
     
     group.add_argument('--enable_cdcpp_scheduler', action='store_true', default=False,)
-    group.add_argument('--static_schedule', type=str, default=None, choices=['1F1B', 'GPipe','Interleaved1F1B','Hanayo','ZBH1','ZBV',])
+    group.add_argument('--static_schedule', type=str, default=None, choices=['1F1B', 'GPipe','Interleaved1F1B','ZBH1','ZBV',])
+    group.add_argument('--dynamic_schedule', type=str, default=None, choices=['wave', 'ud',])
+    group.add_argument('--dynamic_mem_factor', type=float, default=1.0, help='Need profiling. Limit the memory to factor * pp_size * chunks * M_F')
     
-    group.add_argument('--cdc_verbose_print', action='store_true', default=False, help='CDC verbose message for debugging')
+    group.add_argument('--head_tail_as_one_layer', action='store_true', default=False, help='a hacky way to view vocabembedding and lm head as one layer')
+    
+    group.add_argument('--enable_cdc_profile', action='store_true', default=False, help='CDC profile')
+    group.add_argument('--cdc_profile_iter', type=int, default=2, help='CDC profile iteration')
+    
+    group.add_argument('--cdc_verbose_print', type=int, default=0, help='CDC verbose message for debugging, 1:info, 2:runtrace')
     group.add_argument('--cdc_print_rank', type=int, default=-1, help='CDC print rank, -1 means all ranks')
 
     group.add_argument('--num_dc', type=int, default=1, help='Number of datacenters')
     group.add_argument('--pp_stages_per_dc', type=int, nargs='+', default=[], help='Number of pipeline stages in each datacenter, e.g 2 2')
     group.add_argument('--cdc_latency', type=int, default=0, help='Latency in ms between datacenters')
+    group.add_argument('--cdc_latency_as_F_blocks', type=float, default=0.0, help="Notice: need profiling. overwrite cdc_latency as T_F * num_chunks.")
 
 
     group.add_argument('--tensor-model-parallel-size', type=int, default=1,
