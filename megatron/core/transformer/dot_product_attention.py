@@ -15,7 +15,8 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
 from megatron.core.utils import divide
-
+from megatron.training import get_args
+from flash_attn import flash_attn_func
 
 class DotProductAttention(MegatronModule):
     """
@@ -52,6 +53,12 @@ class DotProductAttention(MegatronModule):
         assert (
             self.config.window_size is None
         ), "Sliding Window Attention is only supported by TEDotProductAttention!"
+        
+        self.args = get_args()
+        
+        self.use_flash_attn = False
+        if self.args.use_flash_attn:
+            self.use_flash_attn = True
 
         self.layer_number = max(1, layer_number)
         self.attn_mask_type = attn_mask_type
@@ -66,6 +73,9 @@ class DotProductAttention(MegatronModule):
         self.num_attention_heads_per_partition = divide(self.config.num_attention_heads, world_size)
         self.num_query_groups_per_partition = divide(self.config.num_query_groups, world_size)
 
+        if self.use_flash_attn:
+            return
+        
         coeff = None
         self.norm_factor = math.sqrt(self.hidden_size_per_attention_head)
         if self.config.apply_query_key_layer_scaling:
@@ -103,6 +113,20 @@ class DotProductAttention(MegatronModule):
             "Please use TEDotProductAttention instead."
         )
 
+        if self.use_flash_attn:
+            # input shape [sk, b, ng, hn]
+            assert attn_mask_type == AttnMaskType.causal, "Should be causal"
+            query = query.permute(1, 0, 2, 3).contiguous()
+            key = key.permute(1, 0, 2, 3).contiguous()
+            value = value.permute(1, 0, 2, 3).contiguous()
+            output: torch.Tensor = flash_attn_func(q=query, k=key, v=value, causal=True)
+            
+            # output shape: [b, sq, nh, hn] -> [sq, b, hp]
+            context = output.permute(1, 0, 2, 3).contiguous()
+            new_context_shape = context.size()[:-2] + (self.hidden_size_per_partition,)
+            context = context.view(*new_context_shape)
+            return context        
+        
         # ===================================
         # Raw attention scores. [b, n/p, s, s]
         # ===================================
