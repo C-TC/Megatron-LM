@@ -142,7 +142,7 @@ class CDCDynamicScheduleGenerator:
         if args.cdc_latency_as_F_blocks > 0.0:
             self.override_T_C(args.cdc_latency_as_F_blocks)
 
-        if args.dynamic_mem_factor != 1.0:
+        if args.dynamic_mem_factor > 0.0:
             self.override_M_Limit(args.dynamic_mem_factor)
 
     def override_T_C(self, cdc_latency_as_F_blocks: float) -> None:
@@ -166,13 +166,10 @@ class CDCDynamicScheduleGenerator:
 
     def override_M_Limit(self, mem_factor: float) -> None:
         for i in range(self.pp_size):
-            new_mem_limit = (
-                self.pp_size * self.num_chunks * mem_factor * self.M_F_list[i]
+            new_mem_limit = int(
+                self.pp_size * self.num_chunks * mem_factor * self.M_F_list[i] * 1.05
             )
-            assert (
-                new_mem_limit <= self.M_Limit_list[i]
-            ), "New memory limit may exceed GPU Mem cap"
-            self.M_Limit_list[i] = new_mem_limit
+            self.M_Limit_list[i] = min(new_mem_limit, self.M_Limit_list[i])
 
     def generate_schedule_from_profile(self) -> None:
         if self.schedule_type == "wave":
@@ -409,6 +406,18 @@ class CDCPPScheduler:
         self.no_sync_context = None
 
         self.validate_args()
+        
+        self.exp_logging = args.cdc_exp_logging
+        if self.tp_rank != 0 or self.dp_rank != 0 or self.pp_rank != 0:
+            self.exp_logging = False
+            # only log on rank 0 now
+        self.exp_logging_path = args.tensorboard_dir
+        self.exp_logging_start_iter = 2
+        self.exp_logging_end_iter = args.exit_iter - 1
+        self.exp_logging_iter_time = []
+        self.exp_logging_max_allocated_mem = []
+        if self.exp_logging:
+            assert self.exp_logging_start_iter + 10 < self.exp_logging_end_iter
 
     def clean_up(self):
         # get ready for the next iteration
@@ -701,6 +710,11 @@ class CDCPPScheduler:
             # high precision timer on cpu
             torch.cuda.default_stream(torch.cuda.current_device()).synchronize()
             time_before = time.perf_counter()
+            
+        if self.exp_logging and self.exp_logging_first_mb and self.args.curr_iteration >= self.exp_logging_start_iter:
+            # start timing before first compute task
+            torch.cuda.synchronize()
+            self.exp_logging_iter_time.append(time.perf_counter())
 
         if task_type == "F" and (not forward_only or mb_id < num_microbatches):
             self.cdc_print(
@@ -983,8 +997,12 @@ class CDCPPScheduler:
             * torch.tensor([], dtype=config.pipeline_dtype).element_size()
         )
 
-        for compute_task in self.pp_execution_plan_cur_device:
+        for idx, compute_task in enumerate(self.pp_execution_plan_cur_device):
             # self.cdc_print(f"compute_task: {compute_task}")
+            self.exp_logging_first_mb = False
+            if self.exp_logging:
+                if idx == 0:
+                    self.exp_logging_first_mb = True
             self.schedule_compute_task(
                 compute_task=compute_task,
                 model=model,
@@ -1091,7 +1109,7 @@ class CDCPPScheduler:
                     else:
                         M_W_list.append(0)
                     M_B_list.append(-M_F_list[-1] - M_W_list[-1])
-                    M_Limit_list.append(max_gpu_mem - base_mem_list[-1])
+                    M_Limit_list.append(int((max_gpu_mem - base_mem_list[-1]) * 0.98))
                 # T_C
                 alpha_to_next, alpha_to_prev, beta_to_next, beta_to_prev = json_results[
                     0
@@ -1119,6 +1137,40 @@ class CDCPPScheduler:
                         },
                         f,
                     )
+
+
+        if self.exp_logging and self.args.curr_iteration >= self.exp_logging_start_iter:
+            torch.cuda.synchronize()
+            self.exp_logging_iter_time[-1] = time.perf_counter() - self.exp_logging_iter_time[-1]
+            self.exp_logging_max_allocated_mem.append(torch.cuda.max_memory_allocated())
+        
+        if self.exp_logging and self.args.curr_iteration == self.exp_logging_end_iter:
+            # write to json
+            timpstamp = int(time.time())
+            schedule = self.args.static_schedule if self.use_static_schedule else self.args.dynamic_schedule
+            with open(os.path.join(self.exp_logging_path, f"exp_{timpstamp}.json"), "w") as f:
+                json.dump(
+                    {
+                        "iter_time": self.exp_logging_iter_time,
+                        "max_mem": self.exp_logging_max_allocated_mem,
+                        "config" : {
+                            "schedule": schedule,
+                            "TP": self.args.tensor_model_parallel_size,
+                            "PP": self.args.pipeline_model_parallel_size,
+                            "DP": self.args.data_parallel_size,
+                            "seq_len": self.args.seq_length,
+                            "GBS": self.args.global_batch_size,
+                            "n_DC": self.args.num_dc,
+                            "cdc_latency": self.args.cdc_latency,
+                            "cdc_latency_F_blocks": self.args.cdc_latency_as_F_blocks,
+                            "cdc_actual_latency": self.cdc_latency,
+                            "dyn_mem_factor": self.dynamic_mem_factor,
+                            "num_layers": self.args.num_layers,
+                            "cdc_exp_tf_block_size": self.args.cdc_exp_tf_block_size                            
+                        }
+                    },
+                    f,
+                )
 
         self.clean_up()
 
