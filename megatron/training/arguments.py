@@ -1514,7 +1514,10 @@ def _add_distributed_args(parser):
     group.add_argument('--cdc_profile_iter', type=int, default=2, help='CDC profile iteration')
     
     group.add_argument('--cdc_exp_logging', action='store_true', default=False, help='CDC experiment logging')
-    group.add_argument('--cdc_exp_tf_block_size', type=int, default=0, help='Only for logging: CDC experiment transformer block size')
+    group.add_argument('--cdc_exp_tf_block_size', type=int, default=0, help='Only for logging: CDC experiment transformer block size')    
+    group.add_argument('--cdc_exp_override_latency_ms', type=int, nargs='+', default=[], help='Override CDC latency by force and may regenerate schedule')
+    group.add_argument('--cdc_exp_override_latency_test_iters', type=int, default=3, help='Iterations to test for each latency. Conflict with cdc_latency_as_F_blocks')
+    
     
     group.add_argument('--cdc_verbose_print', type=int, default=0, help='CDC verbose message for debugging, 1:info, 2:runtrace')
     group.add_argument('--cdc_print_rank', type=int, default=-1, help='CDC print rank, -1 means all ranks')

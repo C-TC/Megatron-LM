@@ -1,4 +1,6 @@
+from collections import defaultdict
 import contextlib
+import gc
 import json
 import os
 import time
@@ -140,14 +142,14 @@ class CDCDynamicScheduleGenerator:
         self.pipeline: Pipeline | None = None
 
         if args.cdc_latency_as_F_blocks > 0.0:
-            self.override_T_C(args.cdc_latency_as_F_blocks)
+            T_F_block = np.mean(self.T_F_list)
+            new_latency = T_F_block * args.cdc_latency_as_F_blocks * self.num_chunks
+            self.override_T_C(new_latency)
 
         if args.dynamic_mem_factor > 0.0:
             self.override_M_Limit(args.dynamic_mem_factor)
 
-    def override_T_C(self, cdc_latency_as_F_blocks: float) -> None:
-        T_F_block = np.mean(self.T_F_list)
-        new_latency = T_F_block * cdc_latency_as_F_blocks * self.num_chunks
+    def override_T_C(self, latency_sec) -> None:
         new_T_C = np.zeros((self.pp_size, self.pp_size))
 
         pp_stages_per_dc = process_pp_stages_per_dc(
@@ -159,8 +161,8 @@ class CDCDynamicScheduleGenerator:
         for boundary in dc_boundaries:
             src = (boundary - 1) % self.pp_size
             dst = boundary % self.pp_size
-            new_T_C[src, dst] = new_latency
-            new_T_C[dst, src] = new_latency
+            new_T_C[src, dst] = latency_sec
+            new_T_C[dst, src] = latency_sec
 
         self.T_C_matrix = new_T_C
 
@@ -215,9 +217,12 @@ class CDCDynamicScheduleGenerator:
             )
 
     def get_schedule(self) -> Pipeline:
-        if self.pipeline is None:
-            self.generate_schedule_from_profile()
+        self.generate_schedule_from_profile()
         return self.pipeline
+    
+    def update_latency_ms(self, latency_ms):
+        self.override_T_C(latency_ms / 1000)
+        
 
 
 class CDCPPScheduler:
@@ -408,16 +413,52 @@ class CDCPPScheduler:
         self.validate_args()
         
         self.exp_logging = args.cdc_exp_logging
-        if self.tp_rank != 0 or self.dp_rank != 0 or self.pp_rank != 0:
-            self.exp_logging = False
-            # only log on rank 0 now
+        if self.tp_rank != 0 or self.dp_rank != 0 or self.pp_rank != 0:            
+            self.exp_logging_my_rank = True
+        else:
+            self.exp_logging_my_rank = False
         self.exp_logging_path = args.tensorboard_dir
         self.exp_logging_start_iter = 2
-        self.exp_logging_end_iter = args.exit_iter - 1
-        self.exp_logging_iter_time = []
-        self.exp_logging_max_allocated_mem = []
-        if self.exp_logging:
-            assert self.exp_logging_start_iter + 10 < self.exp_logging_end_iter
+        self.exp_logging_end_iter = args.exit_interval - 1
+        self.exp_logging_iter_time = defaultdict(list)
+        self.exp_logging_max_allocated_mem = defaultdict(list)
+        self.cdc_exp_override_latency = False
+        self.cdc_exp_override_latency_ms = args.cdc_exp_override_latency_ms
+        self.cdc_exp_override_latency_test_iters = args.cdc_exp_override_latency_test_iters
+        # if self.exp_logging:
+        #     assert self.exp_logging_start_iter + 10 < self.exp_logging_end_iter
+        
+        if len(self.cdc_exp_override_latency_ms) > 0:
+            self.cdc_exp_override_latency = True
+            assert not args.cdc_latency_as_F_blocks
+            # if iter = <> then change latency.
+            self.cdc_exp_override_iter = [2 + i * self.cdc_exp_override_latency_test_iters for i in range(len(self.cdc_exp_override_latency_ms))]
+            self.exp_logging_end_iter = self.cdc_exp_override_iter[-1] + self.cdc_exp_override_latency_test_iters
+            args.exit_interval = self.exp_logging_end_iter + 1
+        
+    def update_schedule_with_latency(self, latency_ms):
+        if self.use_static_schedule:
+            self.cdc_latency = latency_ms
+        else:
+            # dynamic schedule
+            self.pp_schedule_generator.update_latency_ms(latency_ms)
+            self.pp_schedule = self.pp_schedule_generator.get_schedule()
+            self.pp_execution_planner = ExecutionPlanner(self.pp_schedule)
+            self.pp_execution_planner.generate_execution_plan()
+            self.pp_execution_plan: List[List[ComputeTask]] = (
+                self.pp_execution_planner.execution_plan
+            )
+
+            self.pp_execution_plan_cur_device: List[ComputeTask] = self.pp_execution_plan[
+                self.pp_rank
+            ]
+
+            self.cdc_print(
+                f"updated execution_plan: \n {self.pp_execution_planner.print_execution_plan()}",
+                rank=0,
+                verbose=2,
+            )
+            self.cdc_latency = latency_ms
 
     def clean_up(self):
         # get ready for the next iteration
@@ -705,16 +746,17 @@ class CDCPPScheduler:
                 )
             # sync default stream
             torch.cuda.default_stream(torch.cuda.current_device()).synchronize()
-            # torch.cuda.empty_cache()
+            gc.collect()
+            torch.cuda.empty_cache()
             mem_before = torch.cuda.memory_allocated(device=torch.cuda.current_device())
             # high precision timer on cpu
             torch.cuda.default_stream(torch.cuda.current_device()).synchronize()
             time_before = time.perf_counter()
             
-        if self.exp_logging and self.exp_logging_first_mb and self.args.curr_iteration >= self.exp_logging_start_iter:
+        if self.exp_logging_my_rank and self.exp_logging_first_mb and self.args.curr_iteration >= self.exp_logging_start_iter:
             # start timing before first compute task
             torch.cuda.synchronize()
-            self.exp_logging_iter_time.append(time.perf_counter())
+            self.exp_logging_iter_time[self.cdc_latency].append(time.perf_counter())
 
         if task_type == "F" and (not forward_only or mb_id < num_microbatches):
             self.cdc_print(
@@ -804,6 +846,8 @@ class CDCPPScheduler:
             # sync default stream
             torch.cuda.default_stream(torch.cuda.current_device()).synchronize()
             time_after = time.perf_counter()
+            gc.collect()
+            torch.cuda.empty_cache()
             mem_after = torch.cuda.memory_allocated(device=torch.cuda.current_device())
             self.cdc_compute_profile_dict[
                 (mb_id, chunk_id, task_type_to_int[task_type])
@@ -996,11 +1040,21 @@ class CDCPPScheduler:
             * tensor_shape[2]
             * torch.tensor([], dtype=config.pipeline_dtype).element_size()
         )
+        
+        if self.cdc_exp_override_latency and len(self.cdc_exp_override_iter) > 0:
+            if self.args.curr_iteration == self.cdc_exp_override_iter[0]:
+                self.update_schedule_with_latency(self.cdc_exp_override_latency_ms[0])
+                self.cdc_exp_override_iter.pop(0)
+                self.cdc_exp_override_latency_ms.pop(0)
+        
+        
+        if self.exp_logging:
+            dist.barrier()
 
         for idx, compute_task in enumerate(self.pp_execution_plan_cur_device):
             # self.cdc_print(f"compute_task: {compute_task}")
             self.exp_logging_first_mb = False
-            if self.exp_logging:
+            if self.exp_logging_my_rank:
                 if idx == 0:
                     self.exp_logging_first_mb = True
             self.schedule_compute_task(
@@ -1139,12 +1193,13 @@ class CDCPPScheduler:
                     )
 
 
-        if self.exp_logging and self.args.curr_iteration >= self.exp_logging_start_iter:
+        if self.exp_logging_my_rank and self.args.curr_iteration >= self.exp_logging_start_iter:
             torch.cuda.synchronize()
-            self.exp_logging_iter_time[-1] = time.perf_counter() - self.exp_logging_iter_time[-1]
-            self.exp_logging_max_allocated_mem.append(torch.cuda.max_memory_allocated())
+            self.exp_logging_iter_time[self.cdc_latency][-1] = time.perf_counter() - self.exp_logging_iter_time[self.cdc_latency][-1]
+            self.exp_logging_max_allocated_mem[self.cdc_latency].append(torch.cuda.max_memory_allocated())
+            torch.cuda.reset_max_memory_allocated()
         
-        if self.exp_logging and self.args.curr_iteration == self.exp_logging_end_iter:
+        if self.exp_logging and self.exp_logging_my_rank and self.args.curr_iteration == self.exp_logging_end_iter:
             # write to json
             timpstamp = int(time.time())
             schedule = self.args.static_schedule if self.use_static_schedule else self.args.dynamic_schedule
@@ -1164,7 +1219,7 @@ class CDCPPScheduler:
                             "cdc_latency": self.args.cdc_latency,
                             "cdc_latency_F_blocks": self.args.cdc_latency_as_F_blocks,
                             "cdc_actual_latency": self.cdc_latency,
-                            "dyn_mem_factor": self.dynamic_mem_factor,
+                            "dyn_mem_factor": self.args.dynamic_mem_factor,
                             "num_layers": self.args.num_layers,
                             "cdc_exp_tf_block_size": self.args.cdc_exp_tf_block_size                            
                         }

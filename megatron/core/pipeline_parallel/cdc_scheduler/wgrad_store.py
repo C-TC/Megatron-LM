@@ -117,6 +117,7 @@ class WGradStore:
             if handle is not None:
                 handle.wait()
         compute_wgrad(*prev_inout, prev_weight)
+        del prev_inout, cur_inout
 
     def is_empty(self) -> bool:
         return len(self.wgrad_blocks) == 0
