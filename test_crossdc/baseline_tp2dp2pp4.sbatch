@@ -10,7 +10,7 @@
 # Setting the environment variables
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_DEBUG=WARN
-export OMP_NUM_THREADS=1
+export OMP_NUM_THREADS=8
 # Extra debugging flags, slow down training
 # export TORCH_CPP_LOG_LEVEL=INFO
 # export TORCH_DISTRIBUTED_DEBUG=DETAIL

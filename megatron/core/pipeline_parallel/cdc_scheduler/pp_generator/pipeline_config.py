@@ -22,6 +22,11 @@ class SystemConfig:
     num_microbatches: int = 8
 
     num_chunks: int = 1
+    
+    # heuristic wave only
+    aux_1b1w: bool = False
+    aux_tear_down_opt: bool = False
+    aux_w_if_b_mem_limited: bool = False
 
     def __hash__(self) -> int:
         # Convert list and ndarray attributes to tuples for hashing

@@ -28,39 +28,46 @@ class SimpleNode:
     start_time: float | int
     end_time: float | int
     type: int = 0
-        
+
+
 class BootStrapSchedule:
-        
     def __init__(self, system_cfg: SystemConfig):
         self.system_cfg = system_cfg
         assert self.system_cfg.num_chunks == 2
-        self.device_tasks: List[List[SimpleNode]] = [[] for _ in range(self.system_cfg.num_devices)]
+        self.device_tasks: List[List[SimpleNode]] = [
+            [] for _ in range(self.system_cfg.num_devices)
+        ]
         self.hard_range = []
-    
+
     def print_schedule(self):
         for i in range(self.system_cfg.num_devices):
             print(f"Device {i}:")
             for node in self.device_tasks[i]:
-                print(f"mb{node.mb_id}chunk{node.chunk_id}, [{node.start_time}, {node.end_time}]")
-                
+                print(
+                    f"mb{node.mb_id}chunk{node.chunk_id}, [{node.start_time}, {node.end_time}]"
+                )
+
     def bootstrap(self):
         M_F = self.system_cfg.M_F
         M_Limit = self.system_cfg.M_Limit
         T_F = self.system_cfg.T_F
         T_B = self.system_cfg.T_B
         T_C = self.system_cfg.T_C
-        assert all([2 * M_F[i] <= M_Limit[i] for i in range(self.system_cfg.num_devices)]), "Not enough memory for 1 V"
-        
-        start_of_backward = 2 * sum(T_F) + 2 * sum([T_C[i, i+1] for i in range(self.system_cfg.num_devices-1)])
+        assert all(
+            [2 * M_F[i] <= M_Limit[i] for i in range(self.system_cfg.num_devices)]
+        ), "Not enough memory for 1 V"
+
+        start_of_backward = 2 * sum(T_F) + 2 * sum(
+            [T_C[i, i + 1] for i in range(self.system_cfg.num_devices - 1)]
+        )
         self.hard_range.append(start_of_backward)
         for i in range(1, self.system_cfg.num_devices):
-            self.hard_range.append(start_of_backward + T_B[i - 1] + T_C[i, i-1])
+            self.hard_range.append(start_of_backward + T_B[i - 1] + T_C[i, i - 1])
             start_of_backward = self.hard_range[-1]
-        
+
         for mb_id in range(self.system_cfg.num_microbatches):
-            self.schedule_mb(mb_id)       
-        
-        
+            self.schedule_mb(mb_id)
+
     def get_avail_ranges(self, device_id, avail_time) -> List[Tuple[float, float]]:
         T_F = self.system_cfg.T_F
         avail_ranges = []
@@ -69,22 +76,26 @@ class BootStrapSchedule:
             if avail_time >= self.hard_range[device_id]:
                 return []
             return [(max(avail_time, cur_start_time), self.hard_range[device_id])]
-        
+
         for node in self.device_tasks[device_id]:
             valid_start_time = max(cur_start_time, avail_time)
             if node.start_time >= valid_start_time + T_F[device_id]:
                 avail_ranges.append((valid_start_time, node.start_time))
             cur_start_time = node.end_time
-        
+
         if cur_start_time < self.hard_range[device_id]:
-            avail_ranges.append((max(cur_start_time, avail_time), self.hard_range[device_id]))
-        
+            avail_ranges.append(
+                (max(cur_start_time, avail_time), self.hard_range[device_id])
+            )
+
         return avail_ranges
-        
+
     def insert(self, avail_time, mb_id, chunk_id, device_id):
         M_Limit = self.system_cfg.M_Limit
         M_F = self.system_cfg.M_F
-        if len(self.device_tasks[device_id]) * M_F[device_id] >= M_Limit[device_id]:
+        if (1 + len(self.device_tasks[device_id])) * M_F[device_id] >= M_Limit[
+            device_id
+        ]:
             # no available memory
             return None
         avail_time_ranges = self.get_avail_ranges(device_id, avail_time)
@@ -93,42 +104,57 @@ class BootStrapSchedule:
             return None
         for start_time, end_time in avail_time_ranges:
             if end_time - start_time >= self.system_cfg.T_F[device_id]:
-                insert_node = SimpleNode(mb_id, chunk_id, start_time, start_time + self.system_cfg.T_F[device_id])
+                insert_node = SimpleNode(
+                    mb_id,
+                    chunk_id,
+                    start_time,
+                    start_time + self.system_cfg.T_F[device_id],
+                )
                 self.device_tasks[device_id].append(insert_node)
                 # sort by start time
                 self.device_tasks[device_id].sort(key=lambda x: x.start_time)
                 return insert_node
-        
+
     def schedule_mb(self, mb_id):
         # forward pass chunk 0
         prev_end_time = 0
-        last_node = self.insert(avail_time=prev_end_time, mb_id=mb_id, chunk_id=0, device_id=0)
+        last_node = self.insert(
+            avail_time=prev_end_time, mb_id=mb_id, chunk_id=0, device_id=0
+        )
         if last_node is None:
             return False
         for i in range(1, self.system_cfg.num_devices):
-            prev_end_time = last_node.end_time + self.system_cfg.T_C[i-1, i]
-            last_node = self.insert(avail_time=prev_end_time, mb_id=mb_id, chunk_id=0, device_id=i)
+            prev_end_time = last_node.end_time + self.system_cfg.T_C[i - 1, i]
+            last_node = self.insert(
+                avail_time=prev_end_time, mb_id=mb_id, chunk_id=0, device_id=i
+            )
             if last_node is None:
                 return False
         # forward pass chunk 1
         prev_end_time = last_node.end_time
-        last_node = self.insert(avail_time=prev_end_time, mb_id=mb_id, chunk_id=1, device_id=self.system_cfg.num_devices-1)
+        last_node = self.insert(
+            avail_time=prev_end_time,
+            mb_id=mb_id,
+            chunk_id=1,
+            device_id=self.system_cfg.num_devices - 1,
+        )
         if last_node is None:
             return False
-        for i in range(self.system_cfg.num_devices-2, -1, -1):
+        for i in range(self.system_cfg.num_devices - 2, -1, -1):
             if mb_id > i:
                 # heuristic: stop
                 break
-            prev_end_time = last_node.end_time + self.system_cfg.T_C[i+1, i]
-            last_node = self.insert(avail_time=prev_end_time, mb_id=mb_id, chunk_id=1, device_id=i)
+            prev_end_time = last_node.end_time + self.system_cfg.T_C[i + 1, i]
+            last_node = self.insert(
+                avail_time=prev_end_time, mb_id=mb_id, chunk_id=1, device_id=i
+            )
             if last_node is None:
                 return False
         return True
-    
+
     def get_bootstrapped_schedule(self):
         return self.device_tasks
-    
-                
+
 
 class ScheduleDevice:
     def __init__(self, dev_id: int, sys_cfg: SystemConfig) -> None:
@@ -153,6 +179,11 @@ class ScheduleDevice:
         self._next_node = None
 
         self.cur_mem_usage = 0
+
+        self.tear_down_phase = False
+        self.aux_1b1w = sys_cfg.aux_1b1w
+        self.aux_tear_down_opt = sys_cfg.aux_tear_down_opt
+        self.aux_w_if_b_mem_limited = sys_cfg.aux_w_if_b_mem_limited
 
     def add_schedulable_node(self, node_list: List[ScheduleNode]):
         self.schedulable_nodes.extend(node_list)
@@ -199,10 +230,39 @@ class ScheduleDevice:
             ]
 
         def node_priority(node: ScheduleNode, mem_allowed: bool):
+            if self.aux_tear_down_opt and self.tear_down_phase:
+                # schedule B1 > B0 > W
+                return [2, 1, 0][node.type] * 2 + node.chunk_id
+
+            # # steady phase
             if mem_allowed:
-                return [2, 1, 0][node.type] * 2 + (node.chunk_id if node.type == 0 else (1 - node.chunk_id))
+                return [2, 1, 0][node.type] * 2 + (
+                    node.chunk_id if node.type == 0 else (1 - node.chunk_id)
+                )
             else:
-                return [0, 2, 1][node.type] * 2 + (node.chunk_id if node.type == 0 else (1 - node.chunk_id))
+                if (
+                    self.aux_w_if_b_mem_limited
+                    and not self.tear_down_phase
+                    and self.cur_mem_usage + self.M_F + self.M_B > self.mem_limit
+                    and self.cur_mem_usage + self.M_W <= self.mem_limit
+                ):
+                    # prefer W
+                    return [0, 1, 2][node.type] * 2 + (
+                        node.chunk_id if node.type != 1 else (1 - node.chunk_id)
+                    )
+                if (
+                    self.aux_1b1w
+                    and len(self.scheduled_nodes) != 0
+                    and self.scheduled_nodes[-1].type == 1
+                ):
+                    # prioritize W
+                    return [2, 0, 1][node.type] * 2 + (
+                        node.chunk_id if node.type == 0 else (1 - node.chunk_id)
+                    )
+
+                return [0, 2, 1][node.type] * 2 + (
+                    node.chunk_id if node.type == 0 else (1 - node.chunk_id)
+                )
 
         mem_allowed_forward = self.cur_mem_usage + self.M_F <= self.mem_limit
 
@@ -282,6 +342,18 @@ class ScheduleDevice:
         return None, math.inf
 
     def update_next(self):
+        num_mb = self.sys_cfg.num_microbatches
+        last_scheduled_node = (
+            self.scheduled_nodes[-1] if len(self.scheduled_nodes) > 0 else None
+        )
+        if last_scheduled_node is not None:
+            if (
+                last_scheduled_node.mb_id == num_mb - 1
+                and last_scheduled_node.chunk_id == 0
+                and last_scheduled_node.type == 0
+            ):
+                self.tear_down_phase = True
+
         next_node, next_avail_time = self._next_to_schedule()
         self._next_node = next_node
         self._next_schedulable_time = next_avail_time
@@ -303,7 +375,7 @@ class ScheduleDevice:
         node.start_time = self._next_schedulable_time
         node.end_time = node.start_time + node.time_cost
         self.update_next()
-        
+
     def schedule_node_force(self, mb_id, chunk_id, type):
         target_node = None
         for node in self.schedulable_nodes:
@@ -315,9 +387,15 @@ class ScheduleDevice:
         self.schedulable_nodes.remove(target_node)
         self.scheduled_nodes.append(target_node)
         self.cur_mem_usage += (
-            self.M_F if target_node.type == 0 else self.M_B if target_node.type == 1 else self.M_W
+            self.M_F
+            if target_node.type == 0
+            else self.M_B
+            if target_node.type == 1
+            else self.M_W
         )
-        target_node.start_time = max(self._next_schedulable_time, target_node.available_time)
+        target_node.start_time = max(
+            self._next_schedulable_time, target_node.available_time
+        )
         target_node.end_time = target_node.start_time + target_node.time_cost
         self.update_next()
         return target_node
@@ -327,6 +405,16 @@ class ZBVHeuristicScheduleV2:
     def __init__(self, system_cfg: SystemConfig):
         self.system_cfg = system_cfg
         assert self.system_cfg.num_chunks == 2
+
+        # # find bottleneck device and unify syscfg
+        # bottleneck_device = self.system_cfg.T_F.index(max(self.system_cfg.T_F))
+        # self.system_cfg.T_F = [self.system_cfg.T_F[bottleneck_device]] * self.system_cfg.num_devices
+        # self.system_cfg.T_B = [self.system_cfg.T_B[bottleneck_device]] * self.system_cfg.num_devices
+        # self.system_cfg.T_W = [self.system_cfg.T_W[bottleneck_device]] * self.system_cfg.num_devices
+        # self.system_cfg.M_F = [self.system_cfg.M_F[bottleneck_device]] * self.system_cfg.num_devices
+        # self.system_cfg.M_B = [self.system_cfg.M_B[bottleneck_device]] * self.system_cfg.num_devices
+        # self.system_cfg.M_W = [self.system_cfg.M_W[bottleneck_device]] * self.system_cfg.num_devices
+        # self.system_cfg.M_Limit = [self.system_cfg.M_Limit[bottleneck_device]] * self.system_cfg.num_devices
 
         self.devices: List[ScheduleDevice] = [
             ScheduleDevice(i, self.system_cfg)
@@ -415,7 +503,7 @@ class ZBVHeuristicScheduleV2:
         bootstrap_schedule = BootStrapSchedule(self.system_cfg)
         bootstrap_schedule.bootstrap()
         bs_schedule = bootstrap_schedule.get_bootstrapped_schedule()
-        
+
         next_schedule_dev = self.next_device_to_schedule()
         assert next_schedule_dev == 0
 
@@ -438,9 +526,18 @@ class ZBVHeuristicScheduleV2:
             if any([len(tasks) != 0 for tasks in bs_schedule]):
                 # force schedule the nodes
                 # schedule the node with the earliest start time
-                cur_schedule_dev: int = min(range(len(bs_schedule)), key=lambda x: bs_schedule[x][0].start_time if len(bs_schedule[x]) > 0 else math.inf)
+                cur_schedule_dev: int = min(
+                    range(len(bs_schedule)),
+                    key=lambda x: bs_schedule[x][0].start_time
+                    if len(bs_schedule[x]) > 0
+                    else math.inf,
+                )
                 cur_simple_node: SimpleNode = bs_schedule[cur_schedule_dev].pop(0)
-                cur_node = self.devices[cur_schedule_dev].schedule_node_force(cur_simple_node.mb_id, cur_simple_node.chunk_id, cur_simple_node.type)
+                cur_node = self.devices[cur_schedule_dev].schedule_node_force(
+                    cur_simple_node.mb_id,
+                    cur_simple_node.chunk_id,
+                    cur_simple_node.type,
+                )
             else:
                 cur_schedule_dev = self.next_device_to_schedule()
                 if self.devices[cur_schedule_dev].next_schedulable_time() == math.inf:
@@ -514,6 +611,7 @@ class ZBVHeuristicScheduleV2:
 
 if __name__ == "__main__":
     from util import generate_comm_mat
+
     sys_config = SystemConfig(
         num_devices=4,
         num_microbatches=8,
@@ -530,5 +628,3 @@ if __name__ == "__main__":
     # bsschedule = BootStrapSchedule(sys_config)
     # bsschedule.bootstrap()
     # bsschedule.print_schedule()
-    
-    
