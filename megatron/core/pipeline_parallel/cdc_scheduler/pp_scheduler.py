@@ -1,6 +1,6 @@
 from collections import defaultdict
 import contextlib
-import gc
+from copy import deepcopy
 import json
 import os
 import time
@@ -10,6 +10,7 @@ from datetime import timedelta
 import numpy as np
 
 from megatron.core.pipeline_parallel.cdc_scheduler.pp_generator.pipeline import (
+    HeuristicWaveZBPipeline,
     HeuristicWaveZBPipelineV2,
     HeuristicZBUDPipeline,
 )
@@ -148,6 +149,27 @@ class CDCDynamicScheduleGenerator:
 
         if args.dynamic_mem_factor > 0.0:
             self.override_M_Limit(args.dynamic_mem_factor)
+            
+        self.dump_profile()
+
+    def dump_profile(self) -> None:
+        if dist.get_rank() != 0:
+            return
+        cur_time = time.time()
+        with open(os.path.join(self.profile_result_path, f"override_{cur_time}.json"), "w") as f:
+            json.dump(
+                {
+                    "T_F": self.T_F_list,
+                    "T_B": self.T_B_list,
+                    "T_C": self.T_C_matrix.tolist(),
+                    "T_W": self.T_W_list,
+                    "M_F": self.M_F_list,
+                    "M_B": self.M_B_list,
+                    "M_W": self.M_W_list,
+                    "M_Limit": self.M_Limit_list,
+                },
+                f,
+            )
 
     def override_T_C(self, latency_sec) -> None:
         new_T_C = np.zeros((self.pp_size, self.pp_size))
@@ -189,9 +211,44 @@ class CDCDynamicScheduleGenerator:
                 num_microbatches=self.num_microbatch,
                 num_chunks=num_chunks,
             )
-            self.pipeline = HeuristicWaveZBPipelineV2(sys_cfg)
-            self.pipeline.schedule()
-            self.pipeline.solve_dependencies()
+            candidates: List[Pipeline] = []
+            try:
+                wave_v1 = HeuristicWaveZBPipeline(sys_cfg)
+                wave_v1.schedule()
+                wave_v1.solve_dependencies()
+            except Exception as e:
+                print(e)
+                wave_v1 = None
+            if wave_v1 is not None:
+                candidates.append(wave_v1)
+            
+            for aux_1b1w in [True,False]:
+                for aux_tear_down_opt in [True,False]:
+                    for aux_w_if_b_mem_limited in [True,False]:
+                        cfg = deepcopy(sys_cfg)
+                        cfg.aux_1b1w = aux_1b1w
+                        cfg.aux_tear_down_opt = aux_tear_down_opt
+                        cfg.aux_w_if_b_mem_limited = aux_w_if_b_mem_limited
+                        try:
+                            cand_pipe = HeuristicWaveZBPipelineV2(cfg)
+                            cand_pipe.schedule()
+                            cand_pipe.solve_dependencies()
+                        except Exception as e:
+                            print(e)
+                            cand_pipe = None
+                        if cand_pipe is not None:
+                            candidates.append(cand_pipe)
+            # select the best pipeline
+            best_pipeline = None
+            best_time = float('inf')
+            for cur_pipe in candidates:
+                pp_runtime = cur_pipe.get_schedule_time(device_wise=True)
+                if pp_runtime < best_time:
+                    best_time = pp_runtime
+                    best_pipeline = cur_pipe
+            assert best_pipeline is not None
+            self.pipeline = best_pipeline
+
         elif self.schedule_type == "ud":
             num_chunks = 1
             sys_cfg = SystemConfig(
@@ -222,6 +279,7 @@ class CDCDynamicScheduleGenerator:
     
     def update_latency_ms(self, latency_ms):
         self.override_T_C(latency_ms / 1000)
+        self.dump_profile()
         
 
 
@@ -414,9 +472,9 @@ class CDCPPScheduler:
         
         self.exp_logging = args.cdc_exp_logging
         if self.tp_rank != 0 or self.dp_rank != 0 or self.pp_rank != 0:            
-            self.exp_logging_my_rank = True
-        else:
             self.exp_logging_my_rank = False
+        else:
+            self.exp_logging_my_rank = True
         self.exp_logging_path = args.tensorboard_dir
         self.exp_logging_start_iter = 2
         self.exp_logging_end_iter = args.exit_interval - 1
@@ -746,8 +804,6 @@ class CDCPPScheduler:
                 )
             # sync default stream
             torch.cuda.default_stream(torch.cuda.current_device()).synchronize()
-            gc.collect()
-            torch.cuda.empty_cache()
             mem_before = torch.cuda.memory_allocated(device=torch.cuda.current_device())
             # high precision timer on cpu
             torch.cuda.default_stream(torch.cuda.current_device()).synchronize()
@@ -846,8 +902,6 @@ class CDCPPScheduler:
             # sync default stream
             torch.cuda.default_stream(torch.cuda.current_device()).synchronize()
             time_after = time.perf_counter()
-            gc.collect()
-            torch.cuda.empty_cache()
             mem_after = torch.cuda.memory_allocated(device=torch.cuda.current_device())
             self.cdc_compute_profile_dict[
                 (mb_id, chunk_id, task_type_to_int[task_type])

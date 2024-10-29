@@ -2,7 +2,6 @@ from dataclasses import dataclass
 import enum
 from typing import Callable, List, Optional, Tuple
 
-from megatron.core.pipeline_parallel.cdc_scheduler.pp_generator.heuristic_loop_schedule import ZBLoopHeuristicSchedule
 from .pipeline_config import SystemConfig
 from .heuristic_schedule import ZBVHeuristicSchedule
 from .heuristic_schedule_v2 import ZBVHeuristicScheduleV2
@@ -1444,45 +1443,6 @@ class HeuristicWaveZBPipelineV2(HeuristicWaveZBPipeline):
         ]
         self.scheduler = ZBVHeuristicScheduleV2(self.sys_config)
 
-class HeuristicLoopZBPipeline(Interleaved1F1BPipeline):
-
-    def __init__(self, sys_config: SystemConfig) -> None:
-        self.sys_config = sys_config
-        assert all([x > 0 for x in self.sys_config.T_W])
-        
-        assert sys_config.num_chunks == 2
-
-        self.device_scheduled_tasks: List[List[InterleavedTaskNode]] = [
-            [] for _ in range(self.sys_config.num_devices)
-        ]
-        self.microbatch_scheduled_tasks: List[List[InterleavedTaskNode]] = [
-            [] for _ in range(self.sys_config.num_microbatches)
-        ]
-        self.scheduler = ZBLoopHeuristicSchedule(self.sys_config)
-
-    def pipeline_name(self):
-        return "HeuristicLoopZB"
-
-    def schedule(self):
-        self.scheduler.schedule()
-        schedule = self.scheduler.get_schedule()
-        print(schedule)
-        num_dev = self.sys_config.num_devices
-
-        for dev in range(num_dev):
-            for i, (dev_id, mb_id, chunk_id, task_type, _) in enumerate(schedule[dev]):
-                self.device_scheduled_tasks[dev].append(
-                    InterleavedTaskNode(
-                        task_type,
-                        dev_id,
-                        mb_id,
-                        chunk_id,
-                        self.device_scheduled_tasks[dev][-1] if i > 0 else None,
-                        None,
-                    )
-                )
-
-        self._resolve_batch_dependency()
 
 class HeuristicZBVPipeline(Interleaved1F1BPipeline):
     """

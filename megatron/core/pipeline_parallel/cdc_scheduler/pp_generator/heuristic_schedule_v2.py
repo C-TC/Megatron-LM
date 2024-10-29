@@ -93,9 +93,7 @@ class BootStrapSchedule:
     def insert(self, avail_time, mb_id, chunk_id, device_id):
         M_Limit = self.system_cfg.M_Limit
         M_F = self.system_cfg.M_F
-        if (1 + len(self.device_tasks[device_id])) * M_F[device_id] >= M_Limit[
-            device_id
-        ]:
+        if (1 + len(self.device_tasks[device_id])) * M_F[device_id] >= M_Limit[device_id]:
             # no available memory
             return None
         avail_time_ranges = self.get_avail_ranges(device_id, avail_time)
