@@ -57,8 +57,11 @@ class BootStrapSchedule:
             [2 * M_F[i] <= M_Limit[i] for i in range(self.system_cfg.num_devices)]
         ), "Not enough memory for 1 V"
 
-        start_of_backward = 2 * sum(T_F) + 2 * sum(
-            [T_C[i, i + 1] for i in range(self.system_cfg.num_devices - 1)]
+        start_of_backward = (
+            2 * sum(T_F)
+            + sum([T_C[i, i + 1] for i in range(self.system_cfg.num_devices - 1)])
+            + sum([T_C[i + 1, i] for i in range(self.system_cfg.num_devices - 1)])
+            + 0.01 * max(T_F)  # rounding error!
         )
         self.hard_range.append(start_of_backward)
         for i in range(1, self.system_cfg.num_devices):
@@ -93,7 +96,9 @@ class BootStrapSchedule:
     def insert(self, avail_time, mb_id, chunk_id, device_id):
         M_Limit = self.system_cfg.M_Limit
         M_F = self.system_cfg.M_F
-        if (1 + len(self.device_tasks[device_id])) * M_F[device_id] >= M_Limit[device_id]:
+        if (1 + len(self.device_tasks[device_id])) * M_F[device_id] >= M_Limit[
+            device_id
+        ]:
             # no available memory
             return None
         avail_time_ranges = self.get_avail_ranges(device_id, avail_time)
@@ -208,24 +213,30 @@ class ScheduleDevice:
         # preference: B0 > B1 > F1 > F0 > W if mem allows
         # Otherwise, B0 > B1 > W > F1 > F0
         # but always prefer no bubble
-        earliest_start_time = min(
-            [node.available_time for node in self.schedulable_nodes]
-        )
+
+        cur_schedulable_nodes = []
         cur_end_time = self.get_current_end_time()
-        if earliest_start_time <= cur_end_time:
-            # probably multiple nodes can be scheduled
-            cur_schedulable_nodes = [
-                node
-                for node in self.schedulable_nodes
-                if node.available_time <= cur_end_time
-            ]
+        available_nodes = [
+            node
+            for node in self.schedulable_nodes
+            if node.available_time <= cur_end_time
+        ]
+        available_nodes_schedulable = [
+            node
+            for node in available_nodes
+            if node.mem_incr + self.cur_mem_usage <= self.mem_limit
+        ]
+        if len(available_nodes_schedulable) > 0:
+            cur_schedulable_nodes = available_nodes_schedulable
         else:
-            # only earliest node can be scheduled to avoid bubble
-            cur_schedulable_nodes = [
-                node
-                for node in self.schedulable_nodes
-                if node.available_time <= earliest_start_time
-            ]
+            # go forward in time to find schedulable nodes
+            self.schedulable_nodes.sort(key=lambda x: x.available_time)
+            for schedulable_node in self.schedulable_nodes:
+                if schedulable_node.mem_incr + self.cur_mem_usage <= self.mem_limit:
+                    cur_schedulable_nodes = [
+                        schedulable_node,
+                    ]
+                    break
 
         def node_priority(node: ScheduleNode, mem_allowed: bool):
             if self.aux_tear_down_opt and self.tear_down_phase:

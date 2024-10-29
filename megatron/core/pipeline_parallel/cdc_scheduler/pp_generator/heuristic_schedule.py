@@ -70,30 +70,39 @@ class ScheduleDevice:
         # preference: B0 > B1 > F1 > F0 > W if mem allows
         # Otherwise, B0 > B1 > W > F1 > F0
         # but always prefer no bubble
-        earliest_start_time = min(
-            [node.available_time for node in self.schedulable_nodes]
-        )
+        cur_schedulable_nodes = []
         cur_end_time = self.get_current_end_time()
-        if earliest_start_time <= cur_end_time:
-            # probably multiple nodes can be scheduled
-            cur_schedulable_nodes = [
-                node
-                for node in self.schedulable_nodes
-                if node.available_time <= cur_end_time
-            ]
+        available_nodes = [
+            node
+            for node in self.schedulable_nodes
+            if node.available_time <= cur_end_time
+        ]
+        available_nodes_schedulable = [
+            node
+            for node in available_nodes
+            if node.mem_incr + self.cur_mem_usage <= self.mem_limit
+        ]
+        if len(available_nodes_schedulable) > 0:
+            cur_schedulable_nodes = available_nodes_schedulable
         else:
-            # only earliest node can be scheduled to avoid bubble
-            cur_schedulable_nodes = [
-                node
-                for node in self.schedulable_nodes
-                if node.available_time <= earliest_start_time
-            ]
+            # go forward in time to find schedulable nodes
+            self.schedulable_nodes.sort(key=lambda x: x.available_time)
+            for schedulable_node in self.schedulable_nodes:
+                if schedulable_node.mem_incr + self.cur_mem_usage <= self.mem_limit:
+                    cur_schedulable_nodes = [
+                        schedulable_node,
+                    ]
+                    break
 
         def node_priority(node: ScheduleNode, mem_allowed: bool):
             if mem_allowed:
-                return [2, 1, 0][node.type] * 2 + (node.chunk_id if node.type == 0 else (1 - node.chunk_id))
+                return [2, 1, 0][node.type] * 2 + (
+                    node.chunk_id if node.type == 0 else (1 - node.chunk_id)
+                )
             else:
-                return [0, 2, 1][node.type] * 2 + (node.chunk_id if node.type == 0 else (1 - node.chunk_id))
+                return [0, 2, 1][node.type] * 2 + (
+                    node.chunk_id if node.type == 0 else (1 - node.chunk_id)
+                )
 
         mem_allowed_forward = self.cur_mem_usage + self.M_F <= self.mem_limit
 
@@ -356,6 +365,7 @@ class ZBVHeuristicSchedule:
             [len(dev.scheduled_nodes) < 6 * self.num_mb for dev in self.devices]
         ):
             print("Warning: some nodes are not scheduled")
+            raise Exception("Failed to schedule all nodes")
 
     def get_schedule(self) -> List[List[Tuple[int, int, int, str, int]]]:
         schedule = [[] for _ in range(self.num_devices)]

@@ -70,43 +70,36 @@ class ScheduleDevice:
         # Otherwise, B > W > F
         # but always prefer no bubble
         mem_allowed_forward = self.cur_mem_usage + self.M_F <= self.mem_limit
-        
-        if mem_allowed_forward:
-            earliest_start_time = min(
-                [node.available_time for node in self.schedulable_nodes]
-            )
-        else:
-            available_nodes = [
-                node for node in self.schedulable_nodes if node.type != 0
-            ]
-            if len(available_nodes) == 0:
-                return None, math.inf
-            earliest_start_time = min(
-                [node.available_time for node in available_nodes]
-            )
 
+        cur_schedulable_nodes = []
         cur_end_time = self.get_current_end_time()
-        if earliest_start_time <= cur_end_time:
-            # probably multiple nodes can be scheduled
-            cur_schedulable_nodes = [
-                node
-                for node in self.schedulable_nodes
-                if node.available_time <= cur_end_time
-            ]
+        available_nodes = [
+            node
+            for node in self.schedulable_nodes
+            if node.available_time <= cur_end_time
+        ]
+        available_nodes_schedulable = [
+            node
+            for node in available_nodes
+            if node.mem_incr + self.cur_mem_usage <= self.mem_limit
+        ]
+        if len(available_nodes_schedulable) > 0:
+            cur_schedulable_nodes = available_nodes_schedulable
         else:
-            # only earliest node can be scheduled to avoid bubble
-            cur_schedulable_nodes = [
-                node
-                for node in self.schedulable_nodes
-                if node.available_time <= earliest_start_time
-            ]
+            # go forward in time to find schedulable nodes
+            self.schedulable_nodes.sort(key=lambda x: x.available_time)
+            for schedulable_node in self.schedulable_nodes:
+                if schedulable_node.mem_incr + self.cur_mem_usage <= self.mem_limit:
+                    cur_schedulable_nodes = [
+                        schedulable_node,
+                    ]
+                    break
 
         def node_priority(node: UDScheduleNode, mem_allowed: bool):
             if mem_allowed:
                 return [1, 2, 0][node.type]
             else:
                 return [0, 2, 1][node.type]
-
 
         def node_cmp(node_l: UDScheduleNode, node_r: UDScheduleNode):
             priority_l = node_priority(node_l, mem_allowed_forward)
@@ -323,7 +316,6 @@ class ZBUDHeuristicSchedule:
                     )
                 )
         return schedule
-
 
 
 class UDHeuristicSchedule:
