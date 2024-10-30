@@ -149,14 +149,20 @@ class CDCDynamicScheduleGenerator:
 
         if args.dynamic_mem_factor > 0.0:
             self.override_M_Limit(args.dynamic_mem_factor)
-            
+
+        if dist.get_rank() == 0:
+            self.rank_zero = True
+        else:
+            self.rank_zero = False
         self.dump_profile()
 
     def dump_profile(self) -> None:
-        if dist.get_rank() != 0:
+        if not self.rank_zero:
             return
         cur_time = time.time()
-        with open(os.path.join(self.profile_result_path, f"override_{cur_time}.json"), "w") as f:
+        with open(
+            os.path.join(self.profile_result_path, f"override_{cur_time}.json"), "w"
+        ) as f:
             json.dump(
                 {
                     "T_F": self.T_F_list,
@@ -167,6 +173,7 @@ class CDCDynamicScheduleGenerator:
                     "M_B": self.M_B_list,
                     "M_W": self.M_W_list,
                     "M_Limit": self.M_Limit_list,
+                    "num_mb": self.num_microbatch,
                 },
                 f,
             )
@@ -217,16 +224,18 @@ class CDCDynamicScheduleGenerator:
                 wave_v1.schedule()
                 wave_v1.solve_dependencies()
             except Exception as e:
-                print(e)
+                if self.rank_zero:
+                    print(f"Error when generating HeuristicWaveZBPipeline: {sys_cfg}")
+                    print(e)
                 wave_v1 = None
             if wave_v1 is not None:
                 candidates.append(wave_v1)
-            
-            for aux_1b1w in [True,False]:
-                for aux_tear_down_opt in [True,False]:
-                    for aux_w_if_b_mem_limited in [True,False]:
+
+            for bootstrap_soft_bound in [True, False]:
+                for aux_tear_down_opt in [True, False]:
+                    for aux_w_if_b_mem_limited in [True, False]:
                         cfg = deepcopy(sys_cfg)
-                        cfg.aux_1b1w = aux_1b1w
+                        cfg.bootstrap_soft_bound = bootstrap_soft_bound
                         cfg.aux_tear_down_opt = aux_tear_down_opt
                         cfg.aux_w_if_b_mem_limited = aux_w_if_b_mem_limited
                         try:
@@ -234,13 +243,17 @@ class CDCDynamicScheduleGenerator:
                             cand_pipe.schedule()
                             cand_pipe.solve_dependencies()
                         except Exception as e:
-                            print(e)
+                            if self.rank_zero:
+                                print(
+                                    f"Error when generating HeuristicWaveZBPipelineV2: {cfg}"
+                                )
+                                print(e)
                             cand_pipe = None
                         if cand_pipe is not None:
                             candidates.append(cand_pipe)
             # select the best pipeline
             best_pipeline = None
-            best_time = float('inf')
+            best_time = float("inf")
             for cur_pipe in candidates:
                 pp_runtime = cur_pipe.get_schedule_time(device_wise=True)
                 if pp_runtime < best_time:
@@ -264,9 +277,31 @@ class CDCDynamicScheduleGenerator:
                 num_microbatches=self.num_microbatch,
                 num_chunks=num_chunks,
             )
-            self.pipeline = HeuristicZBUDPipeline(sys_cfg)
-            self.pipeline.schedule()
-            self.pipeline.solve_dependencies()
+            candidates: List[Pipeline] = []
+            for aux_interleave_priority in [True, False]:
+                cfg = deepcopy(sys_cfg)
+                cfg.aux_interleave_priority = aux_interleave_priority
+                try:
+                    cand_pipe = HeuristicZBUDPipeline(cfg)
+                    cand_pipe.schedule()
+                    cand_pipe.solve_dependencies()
+                except Exception as e:
+                    if self.rank_zero:
+                        print(f"Error when generating HeuristicZBUDPipeline: {cfg}")
+                        print(e)
+                    cand_pipe = None
+                if cand_pipe is not None:
+                    candidates.append(cand_pipe)
+            # select the best pipeline
+            best_pipeline = None
+            best_time = float("inf")
+            for cur_pipe in candidates:
+                pp_runtime = cur_pipe.get_schedule_time(device_wise=True)
+                if pp_runtime < best_time:
+                    best_time = pp_runtime
+                    best_pipeline = cur_pipe
+            assert best_pipeline is not None
+            self.pipeline = best_pipeline
 
         if dist.get_rank() == 0:
             self.pipeline.print_schedule(
@@ -276,11 +311,10 @@ class CDCDynamicScheduleGenerator:
     def get_schedule(self) -> Pipeline:
         self.generate_schedule_from_profile()
         return self.pipeline
-    
+
     def update_latency_ms(self, latency_ms):
         self.override_T_C(latency_ms / 1000)
         self.dump_profile()
-        
 
 
 class CDCPPScheduler:
@@ -469,9 +503,9 @@ class CDCPPScheduler:
         self.no_sync_context = None
 
         self.validate_args()
-        
+
         self.exp_logging = args.cdc_exp_logging
-        if self.tp_rank != 0 or self.dp_rank != 0 or self.pp_rank != 0:            
+        if self.tp_rank != 0 or self.dp_rank != 0 or self.pp_rank != 0:
             self.exp_logging_my_rank = False
         else:
             self.exp_logging_my_rank = True
@@ -482,18 +516,26 @@ class CDCPPScheduler:
         self.exp_logging_max_allocated_mem = defaultdict(list)
         self.cdc_exp_override_latency = False
         self.cdc_exp_override_latency_ms = args.cdc_exp_override_latency_ms
-        self.cdc_exp_override_latency_test_iters = args.cdc_exp_override_latency_test_iters
+        self.cdc_exp_override_latency_test_iters = (
+            args.cdc_exp_override_latency_test_iters
+        )
         # if self.exp_logging:
         #     assert self.exp_logging_start_iter + 10 < self.exp_logging_end_iter
-        
+
         if len(self.cdc_exp_override_latency_ms) > 0:
             self.cdc_exp_override_latency = True
             assert not args.cdc_latency_as_F_blocks
             # if iter = <> then change latency.
-            self.cdc_exp_override_iter = [2 + i * self.cdc_exp_override_latency_test_iters for i in range(len(self.cdc_exp_override_latency_ms))]
-            self.exp_logging_end_iter = self.cdc_exp_override_iter[-1] + self.cdc_exp_override_latency_test_iters
+            self.cdc_exp_override_iter = [
+                2 + i * self.cdc_exp_override_latency_test_iters
+                for i in range(len(self.cdc_exp_override_latency_ms))
+            ]
+            self.exp_logging_end_iter = (
+                self.cdc_exp_override_iter[-1]
+                + self.cdc_exp_override_latency_test_iters
+            )
             args.exit_interval = self.exp_logging_end_iter + 1
-        
+
     def update_schedule_with_latency(self, latency_ms):
         if self.use_static_schedule:
             self.cdc_latency = latency_ms
@@ -507,9 +549,9 @@ class CDCPPScheduler:
                 self.pp_execution_planner.execution_plan
             )
 
-            self.pp_execution_plan_cur_device: List[ComputeTask] = self.pp_execution_plan[
-                self.pp_rank
-            ]
+            self.pp_execution_plan_cur_device: List[ComputeTask] = (
+                self.pp_execution_plan[self.pp_rank]
+            )
 
             self.cdc_print(
                 f"updated execution_plan: \n {self.pp_execution_planner.print_execution_plan()}",
@@ -808,8 +850,12 @@ class CDCPPScheduler:
             # high precision timer on cpu
             torch.cuda.default_stream(torch.cuda.current_device()).synchronize()
             time_before = time.perf_counter()
-            
-        if self.exp_logging_my_rank and self.exp_logging_first_mb and self.args.curr_iteration >= self.exp_logging_start_iter:
+
+        if (
+            self.exp_logging_my_rank
+            and self.exp_logging_first_mb
+            and self.args.curr_iteration >= self.exp_logging_start_iter
+        ):
             # start timing before first compute task
             torch.cuda.synchronize()
             self.exp_logging_iter_time[self.cdc_latency].append(time.perf_counter())
@@ -1094,14 +1140,13 @@ class CDCPPScheduler:
             * tensor_shape[2]
             * torch.tensor([], dtype=config.pipeline_dtype).element_size()
         )
-        
+
         if self.cdc_exp_override_latency and len(self.cdc_exp_override_iter) > 0:
             if self.args.curr_iteration == self.cdc_exp_override_iter[0]:
                 self.update_schedule_with_latency(self.cdc_exp_override_latency_ms[0])
                 self.cdc_exp_override_iter.pop(0)
                 self.cdc_exp_override_latency_ms.pop(0)
-        
-        
+
         if self.exp_logging:
             dist.barrier()
 
@@ -1231,6 +1276,8 @@ class CDCPPScheduler:
                         alpha_to_prev[i] + beta_to_prev[i] * message_size
                     )
 
+                # make T_C symmetric
+                T_C_matrix = (T_C_matrix + T_C_matrix.T) / 2
                 with open(os.path.join(json_file_path, "total.json"), "w") as f:
                     json.dump(
                         {
@@ -1246,23 +1293,39 @@ class CDCPPScheduler:
                         f,
                     )
 
-
-        if self.exp_logging_my_rank and self.args.curr_iteration >= self.exp_logging_start_iter:
+        if (
+            self.exp_logging_my_rank
+            and self.args.curr_iteration >= self.exp_logging_start_iter
+        ):
             torch.cuda.synchronize()
-            self.exp_logging_iter_time[self.cdc_latency][-1] = time.perf_counter() - self.exp_logging_iter_time[self.cdc_latency][-1]
-            self.exp_logging_max_allocated_mem[self.cdc_latency].append(torch.cuda.max_memory_allocated())
+            self.exp_logging_iter_time[self.cdc_latency][-1] = (
+                time.perf_counter() - self.exp_logging_iter_time[self.cdc_latency][-1]
+            )
+            self.exp_logging_max_allocated_mem[self.cdc_latency].append(
+                torch.cuda.max_memory_allocated()
+            )
             torch.cuda.reset_max_memory_allocated()
-        
-        if self.exp_logging and self.exp_logging_my_rank and self.args.curr_iteration == self.exp_logging_end_iter:
+
+        if (
+            self.exp_logging
+            and self.exp_logging_my_rank
+            and self.args.curr_iteration == self.exp_logging_end_iter
+        ):
             # write to json
             timpstamp = int(time.time())
-            schedule = self.args.static_schedule if self.use_static_schedule else self.args.dynamic_schedule
-            with open(os.path.join(self.exp_logging_path, f"exp_{timpstamp}.json"), "w") as f:
+            schedule = (
+                self.args.static_schedule
+                if self.use_static_schedule
+                else self.args.dynamic_schedule
+            )
+            with open(
+                os.path.join(self.exp_logging_path, f"exp_{timpstamp}.json"), "w"
+            ) as f:
                 json.dump(
                     {
                         "iter_time": self.exp_logging_iter_time,
                         "max_mem": self.exp_logging_max_allocated_mem,
-                        "config" : {
+                        "config": {
                             "schedule": schedule,
                             "TP": self.args.tensor_model_parallel_size,
                             "PP": self.args.pipeline_model_parallel_size,
@@ -1275,8 +1338,8 @@ class CDCPPScheduler:
                             "cdc_actual_latency": self.cdc_latency,
                             "dyn_mem_factor": self.args.dynamic_mem_factor,
                             "num_layers": self.args.num_layers,
-                            "cdc_exp_tf_block_size": self.args.cdc_exp_tf_block_size                            
-                        }
+                            "cdc_exp_tf_block_size": self.args.cdc_exp_tf_block_size,
+                        },
                     },
                     f,
                 )

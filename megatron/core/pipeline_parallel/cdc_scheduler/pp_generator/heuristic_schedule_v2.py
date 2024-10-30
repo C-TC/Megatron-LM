@@ -38,6 +38,7 @@ class BootStrapSchedule:
             [] for _ in range(self.system_cfg.num_devices)
         ]
         self.hard_range = []
+        self.soft_bound = system_cfg.bootstrap_soft_bound
 
     def print_schedule(self):
         for i in range(self.system_cfg.num_devices):
@@ -67,6 +68,28 @@ class BootStrapSchedule:
         for i in range(1, self.system_cfg.num_devices):
             self.hard_range.append(start_of_backward + T_B[i - 1] + T_C[i, i - 1])
             start_of_backward = self.hard_range[-1]
+
+        if self.soft_bound:
+            # like zbv, tolerant small delay
+            base_offset = (
+                sum(T_F)
+                + T_F[-1]
+                + sum([T_C[i, i + 1] for i in range(self.system_cfg.num_devices - 1)])
+            )
+            soft_range = [base_offset + 0.01 * max(T_F)] * self.system_cfg.num_devices
+            # backward comm prefix sum
+            T_C_backward = [0]
+            back_wave_comp = [0]
+            for i in range(self.system_cfg.num_devices - 1, 0, -1):
+                T_C_backward.append(T_C_backward[-1] + T_C[i, i - 1])
+                back_wave_comp.append(back_wave_comp[-1] + T_F[i - 1])
+            T_C_backward = T_C_backward[::-1]
+            back_wave_comp = back_wave_comp[::-1]
+            for i in range(self.system_cfg.num_devices):
+                soft_range[i] += T_C_backward[i] + back_wave_comp[i] + 2 * T_F[-1] * i
+            self.hard_range = [
+                max(hard, soft) for hard, soft in zip(self.hard_range, soft_range)
+            ]
 
         for mb_id in range(self.system_cfg.num_microbatches):
             self.schedule_mb(mb_id)
@@ -184,7 +207,6 @@ class ScheduleDevice:
         self.cur_mem_usage = 0
 
         self.tear_down_phase = False
-        self.aux_1b1w = sys_cfg.aux_1b1w
         self.aux_tear_down_opt = sys_cfg.aux_tear_down_opt
         self.aux_w_if_b_mem_limited = sys_cfg.aux_w_if_b_mem_limited
 
@@ -258,15 +280,6 @@ class ScheduleDevice:
                     # prefer W
                     return [0, 1, 2][node.type] * 2 + (
                         node.chunk_id if node.type != 1 else (1 - node.chunk_id)
-                    )
-                if (
-                    self.aux_1b1w
-                    and len(self.scheduled_nodes) != 0
-                    and self.scheduled_nodes[-1].type == 1
-                ):
-                    # prioritize W
-                    return [2, 0, 1][node.type] * 2 + (
-                        node.chunk_id if node.type == 0 else (1 - node.chunk_id)
                     )
 
                 return [0, 2, 1][node.type] * 2 + (
@@ -358,7 +371,7 @@ class ScheduleDevice:
         if last_scheduled_node is not None:
             if (
                 last_scheduled_node.mb_id == num_mb - 1
-                and last_scheduled_node.chunk_id == 0
+                and last_scheduled_node.chunk_id == 1
                 and last_scheduled_node.type == 0
             ):
                 self.tear_down_phase = True
@@ -565,7 +578,7 @@ class ZBVHeuristicScheduleV2:
                             cur_schedule_dev,
                             cur_node.chunk_id,
                             2,
-                            cur_node_end_time,
+                            0,
                             self.get_T_W(cur_schedule_dev),
                             self.get_M_W(cur_schedule_dev),
                         )
@@ -588,7 +601,9 @@ class ZBVHeuristicScheduleV2:
                             next_dev,
                             next_chunk,
                             next_type,
-                            cur_node_end_time + comm_time,
+                            cur_node_end_time + comm_time
+                            if next_dev != cur_schedule_dev
+                            else 0,
                             next_time_cost,
                             next_mem_incr,
                         )

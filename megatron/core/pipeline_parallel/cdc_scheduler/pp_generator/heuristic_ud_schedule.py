@@ -44,6 +44,9 @@ class ScheduleDevice:
 
         self.cur_mem_usage = 0
 
+        self.aux_interleave_priority = sys_cfg.aux_interleave_priority
+        self.tear_down_phase = False
+
     def add_schedulable_node(self, node_list: List[UDScheduleNode]):
         self.schedulable_nodes.extend(node_list)
         self.update_next()
@@ -97,8 +100,19 @@ class ScheduleDevice:
 
         def node_priority(node: UDScheduleNode, mem_allowed: bool):
             if mem_allowed:
+                if self.aux_interleave_priority:
+                    if len(self.scheduled_nodes) > 0:
+                        if self.scheduled_nodes[-1].type != 0:
+                            return [2, 1, 0][node.type]
+
                 return [1, 2, 0][node.type]
             else:
+                if (
+                    self.cur_mem_usage + self.M_F + self.M_B > self.mem_limit
+                    and self.cur_mem_usage + self.M_F + self.M_W <= self.mem_limit
+                    and not self.tear_down_phase
+                ):
+                    return [0, 1, 2][node.type]
                 return [0, 2, 1][node.type]
 
         def node_cmp(node_l: UDScheduleNode, node_r: UDScheduleNode):
@@ -133,6 +147,17 @@ class ScheduleDevice:
         return None, math.inf
 
     def update_next(self):
+        num_mb = self.sys_cfg.num_microbatches
+        last_scheduled_node = (
+            self.scheduled_nodes[-1] if len(self.scheduled_nodes) > 0 else None
+        )
+        if last_scheduled_node is not None:
+            if (
+                last_scheduled_node.mb_id == num_mb - 1
+                and last_scheduled_node.type == 0
+            ):
+                self.tear_down_phase = True
+
         next_node, next_avail_time = self._next_to_schedule()
         self._next_node = next_node
         self._next_schedulable_time = next_avail_time
