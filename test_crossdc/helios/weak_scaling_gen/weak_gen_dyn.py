@@ -102,7 +102,7 @@ SCRIPT_BASENAME="${{SCRIPT_NAME%.*}}"
 JOB_ID=${{SLURM_JOB_ID}}
 
 # create Job log path = script name + job id
-JOB_LOG_PATH="${{BASE_PATH}}/job_logs/{schedule}_${{JOB_ID}}"
+JOB_LOG_PATH="${{BASE_PATH}}/job_logs/weak_{TB_size}_{PP}_{schedule}"
 
 
 source ${{BASE_PATH}}/../source_me.sh
@@ -251,6 +251,7 @@ CDC_ARGS=" \
     --head_tail_as_one_layer \
     --num-layers-per-virtual-pipeline-stage {layer_per_virtual_stage} \
     --cdc_verbose_print 1 \
+    --no-check-for-nan-in-loss-and-grad \
     "
 
 CDC_PROF_ARGS="\
@@ -270,7 +271,7 @@ CDC_EXECUTE_ARGS="\
     --train-sync-interval 1 \
     --cdc_exp_logging \
     --cdc_exp_tf_block_size {int(TB_size[2:])} \
-    --cdc_exp_override_latency_ms 0 2 8 32 128 \
+    --cdc_exp_override_latency_ms 0 2 8 32 \
     --cdc_exp_override_latency_test_iters 10 \
     "
 
@@ -297,6 +298,8 @@ CDC_EXECUTE_CMD="${{CMD}} ${{CDC_ARGS}} ${{CDC_EXECUTE_ARGS}}"
 PROF_RUN="${{CDC_PROF_CMD}}"
 EXECUTE_RUN="${{CDC_EXECUTE_CMD}}"
 
+"""
+            prof_str = f"""\
 srun bash -c "
 export NODE_RANK=\${{SLURM_NODEID}}
 mkdir -p \${{SCRATCH}}/tmp/\${{SLURM_JOBID}}/\${{NODE_RANK}}
@@ -305,7 +308,11 @@ echo \${{SCRATCH}}/tmp/\${{SLURM_JOBID}}/\${{NODE_RANK}}
 echo ${{PROF_RUN}}
 python -c 'import torch; print(f\\"torch version: {{torch.__version__}}\\"); print(f\\"torch path: {{torch.__path__}}\\")'
 ${{PROF_RUN}} 2>&1 | tee ${{LOG_PATH}}
-" ; srun bash -c "
+"
+"""
+
+            exec_str = f"""\
+srun bash -c "
 export NODE_RANK=\${{SLURM_NODEID}}
 mkdir -p \${{SCRATCH}}/tmp/\${{SLURM_JOBID}}/\${{NODE_RANK}}
 export TORCHINDUCTOR_CACHE_DIR=\${{SCRATCH}}/tmp/\${{SLURM_JOBID}}/\${{NODE_RANK}}
@@ -313,13 +320,13 @@ echo \${{SCRATCH}}/tmp/\${{SLURM_JOBID}}/\${{NODE_RANK}}
 echo ${{EXECUTE_RUN}}
 python -c 'import torch; print(f\\"torch version: {{torch.__version__}}\\"); print(f\\"torch path: {{torch.__path__}}\\")'
 ${{EXECUTE_RUN}} 2>&1 | tee ${{LOG_PATH}}
-" ;exit 1
-
+"
 """
-            
             # write the job string to a file
-            with open(f"weak_{TB_size}_{PP}_{schedule}.sh", "w") as f:
-                f.write(job_str)
+            with open(f"weak_{TB_size}_{PP}_{schedule}_prof.sh", "w") as f:
+                f.write('\n'.join([job_str, prof_str]))
+            with open(f"weak_{TB_size}_{PP}_{schedule}_exec.sh", "w") as f:
+                f.write('\n'.join([job_str, exec_str]))
 
         
         
