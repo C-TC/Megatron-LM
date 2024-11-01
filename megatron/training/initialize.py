@@ -287,6 +287,10 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks):
                     f"> initialized pipeline model parallel with size "
                     f"{mpu.get_pipeline_model_parallel_world_size()}"
                 )
+    
+    from megatron.core.gpu_metrics_collect import get_gpu_metrics_collector
+    gpu_metrics_collector = get_gpu_metrics_collector()
+    gpu_metrics_collector.launch_collection_process()
 
 
 def _init_autoresume():
