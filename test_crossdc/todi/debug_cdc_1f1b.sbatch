@@ -157,7 +157,7 @@ TRAINING_ARGS=" \
     --distributed-timeout-minutes 1 \
     --num_dc 2 \
     --pp_stages_per_dc 2 \
-    --cdc_verbose_print \
+    --cdc_verbose_print 1 \
     --cdc_latency 50 \
     "
 #     --cdc_verbose_print

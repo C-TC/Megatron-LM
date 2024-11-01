@@ -515,6 +515,7 @@ class CDCPPScheduler:
         self.exp_logging_iter_time = defaultdict(list)
         self.exp_logging_max_allocated_mem = defaultdict(list)
         self.cdc_exp_override_latency = False
+        self.cdc_exp_dump_execution_plan = args.cdc_exp_dump_execution_plan
         self.cdc_exp_override_latency_ms = args.cdc_exp_override_latency_ms
         self.cdc_exp_override_latency_test_iters = (
             args.cdc_exp_override_latency_test_iters
@@ -535,6 +536,13 @@ class CDCPPScheduler:
                 + self.cdc_exp_override_latency_test_iters
             )
             args.exit_interval = self.exp_logging_end_iter + 1
+            
+        if self.cdc_exp_dump_execution_plan:
+            if self.exp_logging_my_rank:
+                with open(
+                    os.path.join(self.profile_result_path, "exec_plan_init.log"), "w"
+                ) as f:
+                    f.write(self.pp_execution_planner.print_execution_plan())
 
     def update_schedule_with_latency(self, latency_ms):
         if self.use_static_schedule:
@@ -558,6 +566,13 @@ class CDCPPScheduler:
                 rank=0,
                 verbose=2,
             )
+            if self.cdc_exp_dump_execution_plan:
+                if self.exp_logging_my_rank:
+                    with open(
+                        os.path.join(self.profile_result_path, f"exec_plan_lat_{latency_ms}.log"),
+                        "w",) as f:
+                        f.write(self.pp_execution_planner.print_execution_plan())
+                        
             self.cdc_latency = latency_ms
 
     def clean_up(self):
@@ -1309,7 +1324,7 @@ class CDCPPScheduler:
         if (
             self.exp_logging
             and self.exp_logging_my_rank
-            and self.args.curr_iteration == self.exp_logging_end_iter
+            and (self.args.curr_iteration == self.exp_logging_end_iter or (self.cdc_exp_override_latency and len(self.cdc_exp_override_iter) != 0 and self.args.curr_iteration + 1 == self.cdc_exp_override_iter[0]))
         ):
             # write to json
             timpstamp = int(time.time())

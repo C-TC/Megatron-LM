@@ -154,7 +154,7 @@ TRAINING_ARGS=" \
     --no-align-grad-reduce \
     --no-align-param-gather \
     --num-layers-per-virtual-pipeline-stage 4 \
-    --cdc_verbose_print \
+    --cdc_verbose_print 1 \
     --distributed-timeout-minutes 1 \
     "
 #     --cdc_verbose_print

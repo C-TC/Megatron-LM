@@ -157,7 +157,7 @@ TRAINING_ARGS=" \
     --num-layers-per-virtual-pipeline-stage 4 \
     --distributed-timeout-minutes 1 \
     "
-#     --cdc_verbose_print \
+#     --cdc_verbose_print 1 \
 #     --cdc_print_rank -1 \
 
 INITIALIZATION_ARGS=" \

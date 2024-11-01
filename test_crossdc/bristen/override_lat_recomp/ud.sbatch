@@ -223,11 +223,10 @@ CDC_EXECUTE_ARGS="\
     --num_dc 2 \
     --pp_stages_per_dc 2 \
     --cdc_latency 2 \
-    --dynamic_mem_factor 1.5 \
     --train-sync-interval 1 \
     --cdc_exp_logging \
     --cdc_exp_tf_block_size 100 \
-    --cdc_exp_override_latency_ms 0 2 8 32 128 \
+    --cdc_exp_override_latency_ms 0 2 8 32 \
     --cdc_exp_override_latency_test_iters 5 \
     "
 
