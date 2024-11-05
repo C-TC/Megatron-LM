@@ -237,7 +237,7 @@ class TransformerBlock(MegatronModule):
         # offset is implicit in TransformerLayer
         self.layers = torch.nn.ModuleList(
             [
-                build_layer(layer_spec, i + 1)
+                build_layer(layer_spec, i + 1) # layer_number starts at 1
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )

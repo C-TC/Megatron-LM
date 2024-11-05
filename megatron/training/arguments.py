@@ -696,6 +696,18 @@ def core_transformer_config_from_args(args, config_class=None):
     else:
         kw_args['num_query_groups'] = None
     kw_args['config_logger_dir'] = args.config_logger_dir
+    if args.window_size:
+        kw_args['window_size'] = (args.window_size - 1, 0) # Only support causal window for now
+        # Notice layer number start from 1, according to _build_layers()
+        if args.local_attention_every_n_layers:
+            kw_args['is_local_attention'] = \
+                lambda layer: layer % args.local_attention_every_n_layers == 0
+        elif args.global_attention_every_n_layers:
+            kw_args['is_local_attention'] = \
+                lambda layer: layer % args.global_attention_every_n_layers != 0
+        else:
+            raise ValueError("Window size specified without local or global attention every n layers")
+        
 
     # Return config.
     return config_class(**kw_args)
@@ -889,6 +901,10 @@ def _add_network_size_args(parser):
                        help='Untie embeddings and output weights.')
     group.add_argument('--multi-latent-attention', action='store_true',
                        help='Use multi-latent attention for model.')
+    group.add_argument('--window-size', type=int, default=None,help='Window size for sliding window attention. Translates to (window_size - 1, 0) in TE config ')
+    group.add_argument('--local-attention-every-n-layers', type=int, default=None, help='Local attention every n Transformer layers.')
+    group.add_argument('--global-attention-every-n-layers', type=int, default=None, help='Global attention every n Transformer layers.')
+    
     return parser
 
 
