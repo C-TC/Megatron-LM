@@ -48,7 +48,7 @@ class MegatronCompletions(Resource):
         # expected by the generate_and_post_process function
         local_kwargs = {
             "prompts": prompts,
-            "tokens_to_generate": int(req["max_tokens"]),
+            "tokens_to_generate": 0, #int(req["max_tokens"]),
             "temperature": float(req.get("temperature", 1.0)),
             "top_p_sampling": float(req.get("top_p", 1.0)),
             "return_topk_logprobs": int(req.get("logprobs", 0)),
