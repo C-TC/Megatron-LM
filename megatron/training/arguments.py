@@ -505,15 +505,15 @@ def validate_args(args, defaults={}):
     if args.sequence_parallel:
         args.async_tensor_model_parallel_allreduce = False
 
-    if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
-        if args.sequence_parallel:
-            raise RuntimeError(
-                "Using sequence parallelism requires setting the environment variable "
-                "CUDA_DEVICE_MAX_CONNECTIONS to 1")
-        if args.async_tensor_model_parallel_allreduce:
-            raise RuntimeError(
-                "Using async gradient all reduce requires setting the environment "
-                "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
+    # if os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1":
+    #     if args.sequence_parallel:
+    #         raise RuntimeError(
+    #             "Using sequence parallelism requires setting the environment variable "
+    #             "CUDA_DEVICE_MAX_CONNECTIONS to 1")
+    #     if args.async_tensor_model_parallel_allreduce:
+    #         raise RuntimeError(
+    #             "Using async gradient all reduce requires setting the environment "
+    #             "variable CUDA_DEVICE_MAX_CONNECTIONS to 1")
 
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
@@ -1505,19 +1505,28 @@ def _add_distributed_args(parser):
     
     group.add_argument('--enable_cdcpp_scheduler', action='store_true', default=False,)
     group.add_argument('--static_schedule', type=str, default=None, choices=['1F1B', 'GPipe','Interleaved1F1B','ZBH1','ZBV',])
-    group.add_argument('--dynamic_schedule', type=str, default=None, choices=['wave', 'ud',])
-    group.add_argument('--dynamic_mem_factor', type=float, default=-1.0, help='Need profiling. Limit the memory to factor * pp_size * chunks * M_F')
+    group.add_argument('--enable_prefetch_opt', action='store_true', default=False, help='prefetch optimization for static schedule. Dynamic schedule has this opt by default')
+    group.add_argument('--dynamic_schedule', type=str, default=None, choices=['wave', 'ud', 'subud'])
+    group.add_argument('--dynamic_extra_mem_factor', type=float, default=0.0, help='Need profiling. Limit the memory to (1 + factor) * pp_size * chunks * M_F')
     
     group.add_argument('--head_tail_as_one_layer', action='store_true', default=False, help='a hacky way to view vocabembedding and lm head as one layer')
+    group.add_argument('--num_subparts', type=int, default=1, help='number of subparts in each chunk, must be enabled with subschedule and head_tail_as_one_layer')
     
-    group.add_argument('--enable_cdc_profile', action='store_true', default=False, help='CDC profile')
     group.add_argument('--cdc_profile_iter', type=int, default=2, help='CDC profile iteration')
     
     group.add_argument('--cdc_exp_logging', action='store_true', default=False, help='CDC experiment logging')
     group.add_argument('--cdc_exp_tf_block_size', type=int, default=0, help='Only for logging: CDC experiment transformer block size')    
     group.add_argument('--cdc_exp_dump_execution_plan', action='store_true', default=False, help='Dump execution plan for CDC experiment')
-    group.add_argument('--cdc_exp_override_latency_ms', type=int, nargs='+', default=[], help='Override CDC latency by force and may regenerate schedule')
-    group.add_argument('--cdc_exp_override_latency_test_iters', type=int, default=3, help='Iterations to test for each latency. Conflict with cdc_latency_as_F_blocks')
+    group.add_argument('--cdc_exp_per_cfg_test_iters', type=int, default=3, help='Iterations to test for each latency bandwidth pair.')
+    group.add_argument('--cdc_exp_test_start_iter', type=int, default=3, help='Start iteration to test for latency bandwidth injection.')
+    
+    def parse_tuple(s):
+        try:
+            x, y = map(float, s.split(','))
+            return (x, y)
+        except:
+            raise argparse.ArgumentTypeError("Tuple must be float,float")
+    group.add_argument('--cdc_latency_bandwidth_delay_as_F_stage', type=parse_tuple, nargs='+', default=[], help='CDC latency and bandwidth delay pairs as T_F * num_chunks, e,g, 0,0 0.5,0.5')
     
     
     group.add_argument('--cdc_verbose_print', type=int, default=0, help='CDC verbose message for debugging, 1:info, 2:runtrace')
@@ -1525,8 +1534,6 @@ def _add_distributed_args(parser):
 
     group.add_argument('--num_dc', type=int, default=1, help='Number of datacenters')
     group.add_argument('--pp_stages_per_dc', type=int, nargs='+', default=[], help='Number of pipeline stages in each datacenter, e.g 2 2')
-    group.add_argument('--cdc_latency', type=int, default=0, help='Latency in ms between datacenters')
-    group.add_argument('--cdc_latency_as_F_blocks', type=float, default=0.0, help="Notice: need profiling. overwrite cdc_latency as T_F * num_chunks.")
 
 
     group.add_argument('--tensor-model-parallel-size', type=int, default=1,

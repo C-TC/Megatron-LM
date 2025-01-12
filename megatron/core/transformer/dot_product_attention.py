@@ -16,7 +16,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
 from megatron.core.utils import divide
 from megatron.training import get_args
-from flash_attn import flash_attn_func
+from flash_attn.flash_attn_interface import flash_attn_func
 
 class DotProductAttention(MegatronModule):
     """

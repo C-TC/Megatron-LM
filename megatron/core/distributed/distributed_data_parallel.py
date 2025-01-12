@@ -303,6 +303,18 @@ class DistributedDataParallel(MegatronModule):
         Calls the wrapped module's forward() method.
         """
         return self.module(*inputs, **kwargs)
+    
+    def forward_split(self, *inputs, **kwargs):
+        """
+        Calls the wrapped module's forward_split() method.
+        """
+        return self.module.forward_split(*inputs, **kwargs)
+    
+    def backward_split(self, *inputs, **kwargs):
+        """
+        Calls the wrapped module's backward_split() method.
+        """
+        return self.module.backward_split(*inputs, **kwargs)
 
     def _make_forward_pre_hook(self):
         """

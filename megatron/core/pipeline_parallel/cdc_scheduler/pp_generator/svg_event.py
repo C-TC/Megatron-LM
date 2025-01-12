@@ -26,9 +26,10 @@ def load_json_data(filename, start=0, end=None, time_scale=1):
 
 
 ENABLE_BORDER = True
+DISABLE_COL_BORDERS = True
 ENABLE_BATCH_ID = True
 ENABLE_EDGE_BLUR = False
-SCALE_FACTOR = 2
+SCALE_FACTOR = 4
 S = SCALE_FACTOR
 
 # TIME_PER_UNIT = 300 // SCALE_FACTOR
@@ -47,27 +48,36 @@ def to_greyscale(color):
     c = np.dot(GREYSCALE_WEIGHTS, color[:3].astype(float)).astype(int)
     return np.array([c, c, c, 255])
 
+# COLOR_MAP = {
+#     "F": '#74AED4', # azure
+#     "B": '#E63946', # Candy apple red
+#     "D": '#ECA8A9', # 	Cornell Red
+#     # "B": np.array([68, 211, 218]),  # sea color
+#     # "W": to_color_fmt(np.array([47, 158, 73, 255])),
+#     "W": '#D3E2B7', # Paris Green
+#     # "W": np.array([224, 240, 231]),  # sea color
+# }
+
 
 COLOR_VALUE_MAP = {
-    "F": np.array([57, 122, 242]),
-    "B": np.array([62, 181, 191]),
+    "F": np.array([114, 159, 220]), # azure
+    "B": np.array([205, 92, 92]), # crimson glory
+    "D": np.array([231, 143, 137]), # crimson
     # "B": np.array([68, 211, 218]),  # sea color
     # "W": to_color_fmt(np.array([47, 158, 73, 255])),
-    "W": np.array([41, 137, 64]),
+    "W": np.array([160, 218, 184]), # Paris Green
     # "W": np.array([224, 240, 231]),  # sea color
     # "Optimizer": to_color_fmt(np.array([255, 240, 197, 255])),
     "Optimizer": np.array([255, 217, 102]),
 }
-
-
 COLOR_MAP = {k: to_color_fmt(v) for k, v in COLOR_VALUE_MAP.items()}
 
 
 # BORDER_SIZE = SCALE_FACTOR // 2
-BORDER_SIZE = 1
+BORDER_SIZE = 0.15
 SPAN_HEIGHT = SCALE_FACTOR * 10
 FONT_SIZE = SCALE_FACTOR * 10
-TITLE_WIDTH = SCALE_FACTOR * 60
+TITLE_WIDTH = SCALE_FACTOR * 25
 CENTER_TITLE_HEIGHT = SPAN_HEIGHT * 6
 
 WHITE = to_color_fmt(np.array([255, 255, 255, 255]))
@@ -131,7 +141,7 @@ class DrawCtx:
             self.oy + y + font_size - 3,
             textLength=tl, lengthAdjust='spacing',
             text_anchor=anchor,
-            font_family="Times New Roman",
+            font_family="Noto Sans",
             fill=fill,
             # font_style="oblique",
             # font_family="Computer Modern Roman",
@@ -215,8 +225,12 @@ def plot_events(ctx, events, title_text: str, canvas_info: CanvasInfo, include_w
     data_ctx = DrawCtx.from_base_ctx(ctx, 0, TITLE_WIDTH)
 
     for i, evs in enumerate(events):
-        h = i * SPAN_HEIGHT + (i + 1) * BORDER_SIZE
+        h = i * SPAN_HEIGHT + (i + 1) * BORDER_SIZE        
+        wgrad_split = any([x["type"] == "W" for x in evs])
+        # print(evs[0])
         for e in evs:
+            if wgrad_split and e["type"] == "B":
+                e["type"] = "D"
             start = BORDER_SIZE + e["start_time"] // TIME_PER_UNIT
             end = BORDER_SIZE + e["completion_time"] // TIME_PER_UNIT
             if start == end or not ENABLE_EDGE_BLUR:
@@ -224,41 +238,42 @@ def plot_events(ctx, events, title_text: str, canvas_info: CanvasInfo, include_w
             else:
                 plot_span(data_ctx, start + 1, end - 1, h, COLOR_MAP[e["type"]])
                 # plot_span(data_ctx, start, end - 1, h, COLOR_MAP[e["type"]])
-                c = change_color_sat(
-                    COLOR_VALUE_MAP[e["type"]],
-                    (e["start_time"] / TIME_PER_UNIT) % 1.0)
-                plot_span(data_ctx, start, start + 1, h, to_color_fmt(c))
-                c = change_color_sat(
-                    COLOR_VALUE_MAP[e["type"]],
-                    (e["completion_time"] / TIME_PER_UNIT) % 1.0)
-                plot_span(data_ctx, end - 1, end, h, to_color_fmt(c))
+                # c = change_color_sat(
+                #     COLOR_VALUE_MAP[e["type"]],
+                #     (e["start_time"] / TIME_PER_UNIT) % 1.0)
+                # plot_span(data_ctx, start, start + 1, h, to_color_fmt(c))
+                # c = change_color_sat(
+                #     COLOR_VALUE_MAP[e["type"]],
+                #     (e["completion_time"] / TIME_PER_UNIT) % 1.0)
+                # plot_span(data_ctx, end - 1, end, h, to_color_fmt(c))
 
             if ENABLE_BATCH_ID and include_info:
                 minibatch = str(e["minibatch"])
-                center = (start + end) // 2
-                data_ctx.text(h, center, minibatch, font_scale=0.6, fill='black' if e["chunk"] == 0 else 'white')
+                center = (start + end) / 2.
+                data_ctx.text(h+SPAN_HEIGHT / 4., center, minibatch, font_scale=0.6, fill='black' if e["chunk"] == 0 else 'white')
         if ENABLE_BORDER:
             data_ctx.line(h+SPAN_HEIGHT, 0, h+SPAN_HEIGHT+BORDER_SIZE, max_len - 1)
 
-    if ENABLE_BORDER:
+    if ENABLE_BORDER and not DISABLE_COL_BORDERS:
         data_ctx.line(0, 0, 0, max_len - 1)
         data_ctx.line(0, 0, height, 0)
         data_ctx.line(0, max_len - 1, height, max_len - 1)
 
+
     dev_title_ctx = DrawCtx.from_base_ctx(ctx, 0, 0)
     ndev = len(events)
     add_devices(dev_title_ctx, ndev)
-
+    
     if not include_info:
         return
 
-    info_height = ndev * SPAN_HEIGHT + (ndev + 1) * BORDER_SIZE
-    info_ctx = DrawCtx.from_base_ctx(ctx, info_height, 0)
-    add_info(info_ctx, color_text_height, include_w, include_o)
+    # info_height = ndev * SPAN_HEIGHT + (ndev + 1) * BORDER_SIZE
+    # info_ctx = DrawCtx.from_base_ctx(ctx, info_height, 0)
+    # add_info(info_ctx, color_text_height, include_w, include_o)
 
-    if title_text:
-        center_title_ctx = DrawCtx.from_base_ctx(info_ctx, canvas_info.info_height, 0)
-        add_center_title(center_title_ctx, title_text)
+    # if title_text:
+    #     center_title_ctx = DrawCtx.from_base_ctx(info_ctx, canvas_info.info_height, 0)
+    #     add_center_title(center_title_ctx, title_text)
 
 
 def plot_span(ctx, start, end, h, color, ):
@@ -270,7 +285,7 @@ def plot_span(ctx, start, end, h, color, ):
 def add_devices(ctx, devs):
     for i in range(devs):
         h = i * SPAN_HEIGHT + (i + 1) * BORDER_SIZE
-        ctx.text(h, 6 * SCALE_FACTOR, "Device {}".format(i), "left")
+        ctx.text(h, 6 * SCALE_FACTOR, "P{}".format(i), "left")
 
 
 def add_info(ctx, color_text_height, include_w=True, include_o=True):

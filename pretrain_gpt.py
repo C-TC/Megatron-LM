@@ -20,6 +20,7 @@ from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_dataset import MockGPTDataset, GPTDataset
 import megatron.legacy.model
 from megatron.core.models.gpt import GPTModel
+from megatron.core.models.gpt.split_gpt_model import SplitGPTModel
 from megatron.training import pretrain
 from megatron.core.utils import StragglerDetector
 from megatron.core.transformer.spec_utils import import_module
@@ -37,7 +38,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 
 stimer = StragglerDetector()
 
-def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
+def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megatron.legacy.model.GPTModel, SplitGPTModel]:
     """Builds the model.
 
     If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -92,8 +93,9 @@ def model_provider(pre_process=True, post_process=True) -> Union[GPTModel, megat
             except:
                 raise RuntimeError("--fp8-param-gather requires `fp8_model_init` from TransformerEngine, but not found.")
 
+        model_class = GPTModel if args.num_subparts == 1 else SplitGPTModel
         with build_model_context(**build_model_context_args):
-            model = GPTModel(
+            model = model_class(
                 config=config,
                 transformer_layer_spec=transformer_layer_spec,
                 vocab_size=args.padded_vocab_size,
@@ -169,8 +171,9 @@ def loss_func(loss_mask: torch.Tensor, output_tensor: torch.Tensor):
         {'lm loss': (reporting_loss[0], reporting_loss[1])},
     )
 
+_GLOBAL_LOSS_MASK = {}
 
-def forward_step(data_iterator, model: GPTModel):
+def forward_step(data_iterator, model: Union[GPTModel, SplitGPTModel], subpart_idx: int = 0, microbatch_idx: int = 0):
     """Forward training step.
 
     Args:
@@ -179,20 +182,47 @@ def forward_step(data_iterator, model: GPTModel):
     """
     args = get_args()
     timers = get_timers()
+    num_subparts = args.num_subparts
 
-    # Get the batch.
-    timers('batch-generator', log_level=2).start()
-    global stimer
-    with stimer(bdata=True):
+    if num_subparts == 1:
+        # Get the batch.
+        timers('batch-generator', log_level=2).start()
+        global stimer
+        with stimer(bdata=True):
+            tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
+                data_iterator)
+        timers('batch-generator').stop()
+
+        with stimer:
+            output_tensor = model(tokens, position_ids, attention_mask,
+                                labels=labels)
+
+        return output_tensor, partial(loss_func, loss_mask)
+
+    first_subpart = subpart_idx == 0
+    last_subpart = subpart_idx == num_subparts - 1
+    global _GLOBAL_LOSS_MASK
+    if first_subpart:
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch(
             data_iterator)
-    timers('batch-generator').stop()
-
-    with stimer:
-        output_tensor = model(tokens, position_ids, attention_mask,
-                              labels=labels)
-
-    return output_tensor, partial(loss_func, loss_mask)
+        input_dict = {
+            "input_ids": tokens,
+            "position_ids": position_ids,
+            "attention_mask": attention_mask,
+            "labels": labels
+        }
+        _GLOBAL_LOSS_MASK[microbatch_idx] = loss_mask
+    else:
+        input_dict = {}
+    
+    output_tensor = model.forward_split(subpart_idx, microbatch_idx, input_dict=input_dict)
+    
+    if last_subpart:
+        loss_mask = _GLOBAL_LOSS_MASK[microbatch_idx]
+        del _GLOBAL_LOSS_MASK[microbatch_idx]
+        return output_tensor, partial(loss_func, loss_mask)
+    else:
+        return None, None
 
 
 def is_dataset_built_on_rank():

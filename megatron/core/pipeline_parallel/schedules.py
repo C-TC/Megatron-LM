@@ -369,6 +369,10 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         custom_backward(output_tensor[0], output_tensor_grad[0])
     else:
         torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+    
+    # if parallel_state.is_pipeline_last_stage():
+    #     print(f'output_tensor[0]: {output_tensor[0]}')
+    #     print(f'output_tensor_grad[0]: {output_tensor_grad[0]}')
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -395,6 +399,121 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     if config.timers is not None:
         config.timers('backward-compute').stop()
+
+    return input_tensor_grad
+
+def forward_step_subblock(
+    subpart_idx,
+    num_subparts,
+    microbatch_idx,
+    forward_step_func,
+    data_iterator,
+    model,
+    num_microbatches,
+    input_tensor,
+    forward_data_store,
+    config,
+    collect_non_loss_data=False,
+    checkpoint_activations_microbatch=None,
+    is_first_microbatch=False,
+    current_microbatch=None,
+):
+    assert checkpoint_activations_microbatch is None
+    
+    first_subpart = subpart_idx == 0
+    last_subpart = subpart_idx == num_subparts - 1
+    
+    if is_first_microbatch and hasattr(model, 'set_is_first_microbatch'):
+        model.set_is_first_microbatch()
+    if current_microbatch is not None:
+        set_current_microbatch(model, current_microbatch)
+
+    unwrap_output_tensor = False
+    if not isinstance(input_tensor, list):
+        input_tensor = [input_tensor]
+        unwrap_output_tensor = True
+
+    if first_subpart:
+        set_input_tensor = get_attr_wrapped_model(model, "set_input_tensor")
+        set_input_tensor(input_tensor)
+
+    if config.enable_autocast:
+        context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
+    else:
+        context_manager = contextlib.nullcontext()
+    with context_manager:
+        output_tensor, loss_func = forward_step_func(data_iterator, model, subpart_idx=subpart_idx, microbatch_idx=microbatch_idx)
+
+    num_tokens = torch.tensor(0, dtype=torch.int)
+    if parallel_state.is_pipeline_last_stage() and last_subpart:
+        if not collect_non_loss_data:
+            outputs = loss_func(output_tensor)
+            if len(outputs) == 3:
+                output_tensor, num_tokens, loss_reduced = outputs
+                if not config.calculate_per_token_loss:
+                    output_tensor /= num_tokens
+                    output_tensor /= num_microbatches
+            else:
+                # preserve legacy loss averaging behavior (ie, over the number of microbatches)
+                assert len(outputs) == 2
+                output_tensor, loss_reduced = outputs
+                output_tensor /= num_microbatches
+            forward_data_store.append(loss_reduced)
+        else:
+            data = loss_func(output_tensor, non_loss_data=True)
+            forward_data_store.append(data)
+
+    if unwrap_output_tensor:
+        return output_tensor, num_tokens
+    return [output_tensor], num_tokens
+
+
+def backward_step_subblock(subpart_idx, num_subparts, microbatch_idx, model, input_tensor, output_tensor, output_tensor_grad, config):
+
+    first_subpart = subpart_idx == 0
+    last_subpart = subpart_idx == num_subparts - 1
+    
+    unwrap_input_tensor_grad = False
+    if first_subpart:
+        # Retain the grad on the input_tensor.
+        if not isinstance(input_tensor, list):
+            input_tensor = [input_tensor]
+            unwrap_input_tensor_grad = True
+        for x in input_tensor:
+            if x is not None:
+                x.retain_grad()
+
+    if last_subpart:
+        if not isinstance(output_tensor, list):
+            output_tensor = [output_tensor]
+        if not isinstance(output_tensor_grad, list):
+            output_tensor_grad = [output_tensor_grad]
+
+        # Backward pass.
+        if output_tensor_grad[0] is None and config.grad_scale_func is not None:
+            output_tensor[0] = config.grad_scale_func(output_tensor[0])
+
+        model.backward_split(subpart_idx, microbatch_idx, output_tensor_grad[0], output_tensor[0])
+        # if parallel_state.is_pipeline_last_stage():
+        #     print(f'output_tensor[0]: {output_tensor[0]}')
+        #     print(f'output_tensor_grad[0]: {output_tensor_grad[0]}')
+    else:
+        model.backward_split(subpart_idx, microbatch_idx)
+    
+    if not first_subpart:
+        return None
+    # Collect the grad of the input_tensor.
+    input_tensor_grad = [None]
+    if input_tensor is not None:
+        input_tensor_grad = []
+        for x in input_tensor:
+            if x is None:
+                input_tensor_grad.append(None)
+            else:
+                input_tensor_grad.append(x.grad)
+
+    if unwrap_input_tensor_grad:
+        input_tensor_grad = input_tensor_grad[0]
 
     return input_tensor_grad
 

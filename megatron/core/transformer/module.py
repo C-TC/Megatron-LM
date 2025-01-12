@@ -179,6 +179,40 @@ class Float16Module(MegatronModule):
         if parallel_state.is_pipeline_last_stage():
             outputs = float16_to_fp32(outputs)
         return outputs
+    
+    def forward_split(self, *inputs, **kwargs):
+        from megatron.core.models.gpt.split_gpt_model import SplitGPTModel
+
+        assert isinstance(self.module, SplitGPTModel)
+        num_splits = self.module.num_splits
+        if len(inputs) != 0:
+            subpart_idx = inputs[0]
+        else:
+            assert 'subpart_idx' in kwargs
+            subpart_idx = kwargs['subpart_idx']
+        if parallel_state.is_pipeline_first_stage() and subpart_idx == 0:
+            inputs = fp32_to_float16(inputs, self.float16_convertor)
+        outputs = self.module.forward_split(*inputs, **kwargs)
+        if parallel_state.is_pipeline_last_stage() and subpart_idx == num_splits - 1:
+            outputs = float16_to_fp32(outputs)
+        return outputs
+    
+    def backward_split(self, *inputs, **kwargs):
+        from megatron.core.models.gpt.split_gpt_model import SplitGPTModel
+
+        assert isinstance(self.module, SplitGPTModel)
+        num_splits = self.module.num_splits
+        if len(inputs) != 0:
+            subpart_idx = inputs[0]
+        else:
+            assert 'subpart_idx' in kwargs
+            subpart_idx = kwargs['subpart_idx']
+        if parallel_state.is_pipeline_last_stage() and subpart_idx == num_splits - 1:
+            inputs = fp32_to_float16(inputs, self.float16_convertor)
+        outputs = self.module.backward_split(*inputs, **kwargs)
+        if parallel_state.is_pipeline_first_stage() and subpart_idx == 0:
+            outputs = float16_to_fp32(outputs)
+        return outputs
 
     def state_dict(self, destination=None, prefix='', keep_vars=False):
         return self.module.state_dict(destination=destination, prefix=prefix, keep_vars=keep_vars)

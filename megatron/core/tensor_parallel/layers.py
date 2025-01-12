@@ -504,6 +504,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
                 handle = torch.distributed._all_gather_base(
                     all_gather_buffer, input, group=get_tensor_model_parallel_group(), async_op=True
                 )
+                _ = torch.empty(1, device=grad_output.device) + 1
 
                 # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
                 # gather is scheduled before the input gradient computation
@@ -525,6 +526,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             handle = torch.distributed.all_reduce(
                 grad_input, group=get_tensor_model_parallel_group(), async_op=True
             )
+            _ = torch.empty(1, device=grad_output.device) + 1
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # all-reduce is scheduled before the weight gradient computation
 
@@ -538,6 +540,7 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
             handle = torch.distributed._reduce_scatter_base(
                 sub_grad_input, grad_input, group=get_tensor_model_parallel_group(), async_op=True
             )
+            _ = torch.empty(1, device=grad_output.device) + 1
             # Here we rely on CUDA_DEVICE_MAX_CONNECTIONS=1 to ensure that the
             # reduce scatter is scheduled before the weight gradient computation
 

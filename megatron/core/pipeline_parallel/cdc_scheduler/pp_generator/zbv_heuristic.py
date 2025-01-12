@@ -8,7 +8,7 @@ from typing import List, Tuple
 
 import numpy as np
 
-from .pipeline_config import SystemConfig
+from .pipeline_config import PipelineBlockDesc, SystemConfig
 
 @dataclass(eq=True, frozen=True)
 class ScheduledNode:
@@ -449,7 +449,7 @@ class OfficialZBVHeuristicScheduler:
         )
         self.schedule = None
     
-    def get_schedule(self) -> List[List[Tuple[int, int, int, str, int]]]:
+    def get_schedule(self) -> List[List[PipelineBlockDesc]]:
         schedule = [[] for _ in range(self.sys_cfg.num_devices)]
         adapt_schedule: List[ScheduledNode] = self.graph.get_v_schedule()
         for dev in range(self.sys_cfg.num_devices):
@@ -457,12 +457,11 @@ class OfficialZBVHeuristicScheduler:
                 if node.type not in ['F', 'B', 'W']:
                     continue
                 schedule[dev].append(
-                    (
-                        dev,
-                        node.minibatch,
-                        node.chunk,
-                        node.type,
-                        -1,
+                    PipelineBlockDesc(
+                        device_id=dev,
+                        mb_id=node.minibatch,
+                        task_type=node.type,
+                        chunk_id=node.chunk,
                     )
                 )
         return schedule

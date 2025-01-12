@@ -1,25 +1,29 @@
-from collections import defaultdict
 import contextlib
-from copy import deepcopy
 import json
 import os
+import pickle
+import random
 import time
-from typing import Dict, Iterator, List, Tuple, Union
+from typing import Dict, Iterator, List, Optional, Tuple, Union
 from datetime import timedelta
 
 import numpy as np
 
 from megatron.core.pipeline_parallel.cdc_scheduler.pp_generator.pipeline import (
-    HeuristicWaveZBPipeline,
-    HeuristicWaveZBPipelineV2,
-    HeuristicZBUDPipeline,
+    CPZBUDPipeline,
+    CPZBWavePipeline,
 )
+from megatron.core.pipeline_parallel.cdc_scheduler.pp_generator.subpipeline import DynZBUDSubPipeline
 from megatron.core.pipeline_parallel.cdc_scheduler.pp_generator.pipeline_config import (
     SystemConfig,
 )
 from megatron.core.pipeline_parallel.cdc_scheduler.wgrad_store import WGradStore
+from megatron.core.pipeline_parallel.cdc_scheduler.experiment_manager import (
+    ExperimentManager,
+)
 import torch
 import torch.distributed as dist
+import torch.cuda.nvtx as nvtx
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.num_microbatches_calculator import get_num_microbatches
@@ -30,6 +34,8 @@ from megatron.core.pipeline_parallel.schedules import (
     finish_embedding_wgrad_compute,
     forward_step,
     backward_step,
+    forward_step_subblock,
+    backward_step_subblock,
 )
 from megatron.core.utils import get_model_config, get_model_type
 from megatron.training import get_args
@@ -120,11 +126,22 @@ class CDCDynamicScheduleGenerator:
         assert self.schedule_type in [
             "wave",
             "ud",
-        ], "Currently only support wave schedule"
-        self.num_chunks = 1 if self.schedule_type == "ud" else 2
+            "subud",
+        ], "Currently only support ud, subud and wave schedule"
+        self.num_chunks = 2 if self.schedule_type == "wave" else 1
         self.num_microbatch = num_microbatch
-        # self.profile_result_path = profile_result_path
         self.profile_result_path = profile_result_path
+        self.initialized = False
+
+    def initialize(self):
+        # Initialize after profile result is available
+        self.initialized = True
+        args = self.args
+        self.pp_size = args.pipeline_model_parallel_size
+        self.latency_delay = 0
+        self.bandwidth_delay = 0
+        self.injected_latency = np.zeros((self.pp_size, self.pp_size))
+        self.injected_bandwidth = np.zeros((self.pp_size, self.pp_size))
 
         with open(os.path.join(self.profile_result_path, "total.json"), "r") as f:
             profile_result = json.load(f)
@@ -132,54 +149,56 @@ class CDCDynamicScheduleGenerator:
         self.T_B_list = profile_result["T_B"]
         self.T_W_list = profile_result["T_W"]
         self.T_C_matrix = np.array(profile_result["T_C"])
+        self.T_bw_matrix = np.array(profile_result["T_bw"])
         self.M_F_list = profile_result["M_F"]
         self.M_B_list = profile_result["M_B"]
         self.M_W_list = profile_result["M_W"]
         self.M_Limit_list = profile_result["M_Limit"]
 
-        self.pp_size = args.pipeline_model_parallel_size
         assert len(self.T_F_list) == self.pp_size
 
         self.pipeline: Pipeline | None = None
 
-        if args.cdc_latency_as_F_blocks > 0.0:
-            T_F_block = np.mean(self.T_F_list)
-            new_latency = T_F_block * args.cdc_latency_as_F_blocks * self.num_chunks
-            self.override_T_C(new_latency)
-
-        if args.dynamic_mem_factor > 0.0:
-            self.override_M_Limit(args.dynamic_mem_factor)
+        self.override_M_Limit(args.dynamic_extra_mem_factor)
 
         if dist.get_rank() == 0:
             self.rank_zero = True
         else:
             self.rank_zero = False
-        self.dump_profile()
+        # self.dump_profile()
 
-    def dump_profile(self) -> None:
+    def dump_sys_cfg(self, sys_cfg: SystemConfig) -> None:
+        assert self.initialized
         if not self.rank_zero:
             return
         cur_time = time.time()
         with open(
-            os.path.join(self.profile_result_path, f"override_{cur_time}.json"), "w"
+            os.path.join(self.profile_result_path, f"override_cfg_{cur_time}.json"), "w"
         ) as f:
             json.dump(
                 {
-                    "T_F": self.T_F_list,
-                    "T_B": self.T_B_list,
-                    "T_C": self.T_C_matrix.tolist(),
-                    "T_W": self.T_W_list,
-                    "M_F": self.M_F_list,
-                    "M_B": self.M_B_list,
-                    "M_W": self.M_W_list,
-                    "M_Limit": self.M_Limit_list,
-                    "num_mb": self.num_microbatch,
+                    "T_F": sys_cfg.T_F,
+                    "T_B": sys_cfg.T_B,
+                    "T_W": sys_cfg.T_W,
+                    "T_C": sys_cfg.T_C.tolist(),
+                    "T_beta": sys_cfg.T_beta.tolist(),
+                    "M_F": sys_cfg.M_F,
+                    "M_B": sys_cfg.M_B,
+                    "M_W": sys_cfg.M_W,
+                    "M_Limit": sys_cfg.M_Limit,
+                    "num_devices": sys_cfg.num_devices,
+                    "num_microbatches": sys_cfg.num_microbatches,
+                    "num_chunks": sys_cfg.num_chunks,
                 },
                 f,
             )
 
-    def override_T_C(self, latency_sec) -> None:
-        new_T_C = np.zeros((self.pp_size, self.pp_size))
+    def override_T_comm(self, latency_seconds=None, bandwidth_seconds=None):
+        assert self.initialized
+        self.latency_delay = latency_seconds if latency_seconds is not None else 0
+        self.bandwidth_delay = bandwidth_seconds if bandwidth_seconds is not None else 0
+        self.injected_latency = np.zeros((self.pp_size, self.pp_size))
+        self.injected_bandwidth = np.zeros((self.pp_size, self.pp_size))
 
         pp_stages_per_dc = process_pp_stages_per_dc(
             self.args.pp_stages_per_dc, self.pp_size, self.args.num_dc
@@ -190,25 +209,111 @@ class CDCDynamicScheduleGenerator:
         for boundary in dc_boundaries:
             src = (boundary - 1) % self.pp_size
             dst = boundary % self.pp_size
-            new_T_C[src, dst] = latency_sec
-            new_T_C[dst, src] = latency_sec
+            if latency_seconds is not None:
+                self.injected_latency[src, dst] = max(
+                    0, latency_seconds - self.T_C_matrix[src, dst]
+                )
+                self.injected_latency[dst, src] = max(
+                    0, latency_seconds - self.T_C_matrix[dst, src]
+                )
+            if bandwidth_seconds is not None:
+                self.injected_bandwidth[src, dst] = max(
+                    0, bandwidth_seconds - self.T_bw_matrix[src, dst]
+                )
+                self.injected_bandwidth[dst, src] = max(
+                    0, bandwidth_seconds - self.T_bw_matrix[dst, src]
+                )
 
-        self.T_C_matrix = new_T_C
-
-    def override_M_Limit(self, mem_factor: float) -> None:
+    def override_M_Limit(self, extra_mem_factor: float) -> None:
+        assert self.initialized
+        # M_F if no recompute, (M_F + M_B) if recompute
         for i in range(self.pp_size):
-            new_mem_limit = int(
-                self.pp_size * self.num_chunks * mem_factor * self.M_F_list[i] * 1.05
-            )
-            self.M_Limit_list[i] = min(new_mem_limit, self.M_Limit_list[i])
+            unit_memory = max(self.M_F_list[i], self.M_F_list[i] + self.M_B_list[i])
+            new_mem_limit = self.pp_size * self.num_chunks * (1 + extra_mem_factor) * unit_memory * 1.02
+            self.M_Limit_list[i] = new_mem_limit
 
-    def generate_schedule_from_profile(self) -> None:
+    def integerize_sys_cfg(self, sys_cfg: SystemConfig, multiply_factor: int = 1) -> SystemConfig:
+        time_candidate = []
+        memory_candidate = []
+        for work_list in [
+            sys_cfg.T_F,
+            sys_cfg.T_B,
+            sys_cfg.T_C,
+            sys_cfg.T_beta,
+            sys_cfg.T_W,
+        ]:
+            time_candidate.append(np.max(work_list))
+        for work_list in [sys_cfg.M_F, sys_cfg.M_B, sys_cfg.M_W, sys_cfg.M_Limit]:
+            memory_candidate.append(np.max(work_list))
+
+        def scale_to_integers_factor(
+            candidate_list, target_min_diff=10, max_abs_value=100000
+        ):
+            values = np.abs(candidate_list)
+            sorted_values = np.sort(values)
+            # Find minimum non-zero absolute difference between any two values
+            diffs = [b - a for a, b in zip(sorted_values, sorted_values[1:])]
+            non_zero_diffs = [
+                abs(d) for d in diffs if abs(d) > 1e-10
+            ]  # Use small epsilon
+            min_diff = min(non_zero_diffs) if non_zero_diffs else 1.0
+            scaling_reference = min_diff if min_diff > 1e-10 else 1.0
+            scaling_factor = target_min_diff / scaling_reference
+            if np.max(values) * scaling_factor > max_abs_value:
+                scaling_factor = max_abs_value / np.max(values)
+            return scaling_factor
+
+        time_scaling_factor = scale_to_integers_factor(time_candidate)
+        memory_scaling_factor = scale_to_integers_factor(memory_candidate)
+
+        new_T_F = [int(np.round(t * time_scaling_factor)) * multiply_factor for t in sys_cfg.T_F]
+        new_T_B = [int(np.round(t * time_scaling_factor)) * multiply_factor for t in sys_cfg.T_B]
+        new_T_C = np.array(
+            [
+                [int(np.round(t * time_scaling_factor)) * multiply_factor for t in row]
+                for row in sys_cfg.T_C
+            ]
+        )
+        new_T_beta = np.array(
+            [
+                [int(np.round(t * time_scaling_factor)) * multiply_factor for t in row]
+                for row in sys_cfg.T_beta
+            ]
+        )
+        new_T_W = [int(np.round(t * time_scaling_factor)) * multiply_factor for t in sys_cfg.T_W]
+        new_M_F = [int(np.round(m * memory_scaling_factor)) * multiply_factor for m in sys_cfg.M_F]
+        new_M_B = [int(np.round(m * memory_scaling_factor)) * multiply_factor for m in sys_cfg.M_B]
+        new_M_W = [-new_M_F[i] - new_M_B[i] for i in range(len(new_M_F))]
+        new_M_Limit = [
+            int(np.round(m * memory_scaling_factor)) * multiply_factor for m in sys_cfg.M_Limit
+        ]
+        return SystemConfig(
+            T_F=new_T_F,
+            T_B=new_T_B,
+            T_C=new_T_C,
+            T_beta=new_T_beta,
+            T_W=new_T_W,
+            M_F=new_M_F,
+            M_B=new_M_B,
+            M_W=new_M_W,
+            M_Limit=new_M_Limit,
+            num_devices=sys_cfg.num_devices,
+            num_microbatches=sys_cfg.num_microbatches,
+            num_chunks=sys_cfg.num_chunks,
+        ), time_scaling_factor * multiply_factor, memory_scaling_factor * multiply_factor
+
+    def generate_schedule_from_profile(self) -> int:
+        assert self.initialized
+        ud_solution_time = {4: 200, 8: 400, 16: 600}
+        wave_solution_time = {4: 200, 8: 400, 16: 600}
+        estimated_runtime = 0
         if self.schedule_type == "wave":
             num_chunks = 2
             sys_cfg = SystemConfig(
                 T_F=self.T_F_list,
                 T_B=self.T_B_list,
-                T_C=self.T_C_matrix,
+                T_C=self.T_C_matrix + self.injected_latency,
+                T_beta=self.T_bw_matrix + self.injected_bandwidth,
                 T_W=self.T_W_list,
                 M_F=self.M_F_list,
                 M_B=self.M_B_list,
@@ -218,56 +323,78 @@ class CDCDynamicScheduleGenerator:
                 num_microbatches=self.num_microbatch,
                 num_chunks=num_chunks,
             )
-            candidates: List[Pipeline] = []
-            try:
-                wave_v1 = HeuristicWaveZBPipeline(sys_cfg)
-                wave_v1.schedule()
-                wave_v1.solve_dependencies()
-            except Exception as e:
-                if self.rank_zero:
-                    print(f"Error when generating HeuristicWaveZBPipeline: {sys_cfg}")
-                    print(e)
-                wave_v1 = None
-            if wave_v1 is not None:
-                candidates.append(wave_v1)
-
-            for bootstrap_soft_bound in [True, False]:
-                for aux_tear_down_opt in [True, False]:
-                    for aux_w_if_b_mem_limited in [True, False]:
-                        cfg = deepcopy(sys_cfg)
-                        cfg.bootstrap_soft_bound = bootstrap_soft_bound
-                        cfg.aux_tear_down_opt = aux_tear_down_opt
-                        cfg.aux_w_if_b_mem_limited = aux_w_if_b_mem_limited
-                        try:
-                            cand_pipe = HeuristicWaveZBPipelineV2(cfg)
-                            cand_pipe.schedule()
-                            cand_pipe.solve_dependencies()
-                        except Exception as e:
-                            if self.rank_zero:
-                                print(
-                                    f"Error when generating HeuristicWaveZBPipelineV2: {cfg}"
-                                )
-                                print(e)
-                            cand_pipe = None
-                        if cand_pipe is not None:
-                            candidates.append(cand_pipe)
-            # select the best pipeline
-            best_pipeline = None
-            best_time = float("inf")
-            for cur_pipe in candidates:
-                pp_runtime = cur_pipe.get_schedule_time(device_wise=True)
-                if pp_runtime < best_time:
-                    best_time = pp_runtime
-                    best_pipeline = cur_pipe
-            assert best_pipeline is not None
-            self.pipeline = best_pipeline
+            sys_cfg, time_factor, mem_factor = self.integerize_sys_cfg(sys_cfg)
+            if self.rank_zero:
+                self.dump_sys_cfg(sys_cfg)
+                if os.path.exists(
+                    os.path.join(
+                        self.profile_result_path,
+                        f"wave_lat{self.latency_delay}_bw{self.bandwidth_delay}.json",
+                    )
+                ):
+                    with open(
+                        os.path.join(
+                            self.profile_result_path,
+                            f"wave_lat{self.latency_delay}_bw{self.bandwidth_delay}.json",
+                        ),
+                        "r",
+                    ) as f:
+                        pp = CPZBWavePipeline(sys_cfg)
+                        pp.load_schedule_from_dict(json.load(f))
+                        pp.solve_dependencies()
+                else:
+                    pp = CPZBWavePipeline(sys_cfg)
+                    pp.schedule(
+                        time_limit_sec=wave_solution_time[self.pp_size],
+                        relative_gap=0.01,
+                        logging=True,
+                    )
+                    pp.solve_dependencies()
+                    pp.print_schedule(
+                        name=f"wave_lat{self.latency_delay}_bw{self.bandwidth_delay}",
+                        save=True,
+                        save_path=self.profile_result_path,
+                    )
+                    # save schedule as json
+                    with open(
+                        os.path.join(
+                            self.profile_result_path,
+                            f"wave_lat{self.latency_delay}_bw{self.bandwidth_delay}.json",
+                        ),
+                        "w",
+                    ) as f:
+                        json.dump(pp.store_schedule_to_dict(), f)
+            else:
+                # wait till the rank 0 save the schedule, sleep 10s for rank 0 to check
+                pp: Optional[CPZBWavePipeline] = None
+                while pp is None:
+                    time.sleep(random.uniform(5, 10))
+                    # check if the file exists
+                    if os.path.exists(
+                        os.path.join(
+                            self.profile_result_path,
+                            f"wave_lat{self.latency_delay}_bw{self.bandwidth_delay}.json",
+                        )
+                    ):
+                        with open(
+                            os.path.join(
+                                self.profile_result_path,
+                                f"wave_lat{self.latency_delay}_bw{self.bandwidth_delay}.json",
+                            ),
+                            "r",
+                        ) as f:
+                            pp = CPZBWavePipeline(sys_cfg)
+                            pp.load_schedule_from_dict(json.load(f))
+                            pp.solve_dependencies()
+            estimated_runtime = pp.get_schedule_time(device_wise=True) / time_factor
 
         elif self.schedule_type == "ud":
             num_chunks = 1
             sys_cfg = SystemConfig(
                 T_F=self.T_F_list,
                 T_B=self.T_B_list,
-                T_C=self.T_C_matrix,
+                T_C=self.T_C_matrix + self.injected_latency,
+                T_beta=self.T_bw_matrix + self.injected_bandwidth,
                 T_W=self.T_W_list,
                 M_F=self.M_F_list,
                 M_B=self.M_B_list,
@@ -277,44 +404,124 @@ class CDCDynamicScheduleGenerator:
                 num_microbatches=self.num_microbatch,
                 num_chunks=num_chunks,
             )
-            candidates: List[Pipeline] = []
-            for aux_interleave_priority in [True, False]:
-                cfg = deepcopy(sys_cfg)
-                cfg.aux_interleave_priority = aux_interleave_priority
-                try:
-                    cand_pipe = HeuristicZBUDPipeline(cfg)
-                    cand_pipe.schedule()
-                    cand_pipe.solve_dependencies()
-                except Exception as e:
-                    if self.rank_zero:
-                        print(f"Error when generating HeuristicZBUDPipeline: {cfg}")
-                        print(e)
-                    cand_pipe = None
-                if cand_pipe is not None:
-                    candidates.append(cand_pipe)
-            # select the best pipeline
-            best_pipeline = None
-            best_time = float("inf")
-            for cur_pipe in candidates:
-                pp_runtime = cur_pipe.get_schedule_time(device_wise=True)
-                if pp_runtime < best_time:
-                    best_time = pp_runtime
-                    best_pipeline = cur_pipe
-            assert best_pipeline is not None
-            self.pipeline = best_pipeline
-
-        if dist.get_rank() == 0:
-            self.pipeline.print_schedule(
-                name=str(time.time()), save=True, save_path=self.profile_result_path
+            sys_cfg, time_factor, mem_factor = self.integerize_sys_cfg(sys_cfg)
+            if self.rank_zero:
+                self.dump_sys_cfg(sys_cfg)
+                if os.path.exists(
+                    os.path.join(
+                        self.profile_result_path,
+                        f"ud_lat{self.latency_delay}_bw{self.bandwidth_delay}.json",
+                    )
+                ):
+                    with open(
+                        os.path.join(
+                            self.profile_result_path,
+                            f"ud_lat{self.latency_delay}_bw{self.bandwidth_delay}.json",
+                        ),
+                        "r",
+                    ) as f:
+                        pp = CPZBUDPipeline(sys_cfg)
+                        pp.load_schedule_from_dict(json.load(f))
+                        pp.solve_dependencies()
+                else:
+                    pp = CPZBUDPipeline(sys_cfg)
+                    pp.schedule(
+                        time_limit_sec=ud_solution_time[self.pp_size], relative_gap=0.01, logging=True
+                    )
+                    pp.solve_dependencies()
+                    pp.print_schedule(
+                        name=f"ud_lat{self.latency_delay}_bw{self.bandwidth_delay}",
+                        save=True,
+                        save_path=self.profile_result_path,
+                    )
+                    # save schedule as json
+                    with open(
+                        os.path.join(
+                            self.profile_result_path,
+                            f"ud_lat{self.latency_delay}_bw{self.bandwidth_delay}.json",
+                        ),
+                        "w",
+                    ) as f:
+                        json.dump(pp.store_schedule_to_dict(), f)
+            else:
+                # wait till the rank 0 save the schedule, sleep 10s for rank 0 to check
+                pp: Optional[CPZBUDPipeline] = None
+                while pp is None:
+                    time.sleep(random.uniform(10, 20))
+                    # check if the file exists
+                    if os.path.exists(
+                        os.path.join(
+                            self.profile_result_path,
+                            f"ud_lat{self.latency_delay}_bw{self.bandwidth_delay}.json",
+                        )
+                    ):
+                        with open(
+                            os.path.join(
+                                self.profile_result_path,
+                                f"ud_lat{self.latency_delay}_bw{self.bandwidth_delay}.json",
+                            ),
+                            "r",
+                        ) as f:
+                            pp = CPZBUDPipeline(sys_cfg)
+                            pp.load_schedule_from_dict(json.load(f))
+                            pp.solve_dependencies()
+            estimated_runtime = pp.get_schedule_time(device_wise=True) / time_factor
+                            
+        elif self.schedule_type == "subud":
+            num_chunks = 1
+            sys_cfg = SystemConfig(
+                T_F=self.T_F_list,
+                T_B=self.T_B_list,
+                T_C=self.T_C_matrix + self.injected_latency,
+                T_beta=self.T_bw_matrix + self.injected_bandwidth,
+                T_W=self.T_W_list,
+                M_F=self.M_F_list,
+                M_B=self.M_B_list,
+                M_W=self.M_W_list,
+                M_Limit=self.M_Limit_list,
+                num_devices=self.pp_size,
+                num_microbatches=self.num_microbatch,
+                num_chunks=num_chunks,
             )
+            
+            num_subparts = self.args.num_subparts
+            sys_cfg, time_factor, mem_factor = self.integerize_sys_cfg(sys_cfg, num_subparts)
+            pp = DynZBUDSubPipeline(sys_cfg, num_subparts)
+            pp.schedule()
+            pp.solve_dependencies()
+            
+            if self.rank_zero:
+                self.dump_sys_cfg(sys_cfg)
+                pp.print_schedule(
+                    name=f"subud_lat{self.latency_delay}_bw{self.bandwidth_delay}",
+                    save=True,
+                    save_path=self.profile_result_path,
+                )
+                # save schedule as json
+                with open(
+                    os.path.join(
+                        self.profile_result_path,
+                        f"subud_lat{self.latency_delay}_bw{self.bandwidth_delay}.json",
+                    ),
+                    "w",
+                ) as f:
+                    json.dump(pp.store_schedule_to_dict(), f)
+            
+            estimated_runtime = pp.get_schedule_time(device_wise=True) / time_factor
+
+        # barrier
+        dist.barrier()
+        self.pipeline = pp
+        return estimated_runtime
 
     def get_schedule(self) -> Pipeline:
-        self.generate_schedule_from_profile()
-        return self.pipeline
+        estimated_runtime = self.generate_schedule_from_profile()
+        return self.pipeline, estimated_runtime
 
-    def update_latency_ms(self, latency_ms):
-        self.override_T_C(latency_ms / 1000)
-        self.dump_profile()
+    def update_latency_bandwidth_seconds(
+        self, latency_seconds=None, bandwidth_seconds=None
+    ):
+        self.override_T_comm(latency_seconds, bandwidth_seconds)
 
 
 class CDCPPScheduler:
@@ -331,6 +538,13 @@ class CDCPPScheduler:
         self.use_static_schedule = False
         self.use_dynamic_schedule = False
         self.pp_schedule: Pipeline = None
+        
+        self.num_subparts = args.num_subparts
+        if self.num_subparts > 1:
+            assert args.dynamic_schedule == "subud"
+            self.subblock_scheduling = True
+        else:
+            self.subblock_scheduling = False
 
         self.cdc_verbose_print = args.cdc_verbose_print
         self.cdc_print_rank = args.cdc_print_rank
@@ -341,29 +555,11 @@ class CDCPPScheduler:
 
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
         self.dp_rank = parallel_state.get_data_parallel_rank()
-        self.cdc_log_profile = (
-            True if self.tp_rank == 0 and self.dp_rank == 0 else False
-        )
 
         num_microbatch = get_num_microbatches()
-
-        self.profile_result_path = args.tensorboard_dir
-        self.profile_result_file = os.path.join(args.tensorboard_dir, f"{pp_rank}.json")
-        self.enable_cdc_profile = args.enable_cdc_profile
-        if self.enable_cdc_profile:
-            assert (
-                args.cdc_profile_iter < args.train_iters
-            ), "Profile iteration should be less than total iterations"
-        # (mb, chunk, type) -> [time, memory before, memory after]
-        self.cdc_compute_profile_dict = {}
-        # four lists of [alpha, beta] x [to_next, to_prev]
-        self.cdc_comm_profiles = None
-        # basic memory: parameter, grad, optimizer state
-        self.cdc_base_memory = -1
-        # parameters in chunk
-        self.cdc_chunk_parameters: Dict[int, int] = {}
-        # other info to log: chunk -> (vocabembedding, lmhead, numlayers)
-        self.cdc_layer_info = {}
+        self.num_microbatch = num_microbatch
+        
+        exp_dir = args.tensorboard_dir
 
         # static schedule
         if args.static_schedule is not None:
@@ -372,48 +568,42 @@ class CDCPPScheduler:
             self.pp_schedule = get_default_static_schedule(
                 args.static_schedule, pp_size, num_microbatch
             )
+            self.pp_schedule_generator = None
         else:
             assert args.dynamic_schedule is not None
-            assert (
-                self.enable_cdc_profile is False
-            ), "CDC profile should be enabled with static schedule"
             self.use_dynamic_schedule = True
             self.dynamic_schedule_type = args.dynamic_schedule
-            # profile_result_path should exist
-            assert os.path.exists(
-                self.profile_result_path
-            ), f"Profile result path {self.profile_result_path} does not exist"
             self.pp_schedule_generator = CDCDynamicScheduleGenerator(
                 args,
                 self.dynamic_schedule_type,
                 num_microbatch,
-                self.profile_result_path,
+                exp_dir,
             )
-            self.pp_schedule = self.pp_schedule_generator.get_schedule()
-
-        if args.cdc_latency_as_F_blocks:
-            # for both static and dynamic, adjust the cdc latency from profile
-
-            # profile_result_path should exist
-            assert os.path.exists(
-                self.profile_result_path
-            ), f"Profile result path {self.profile_result_path} does not exist"
-
-            with open(os.path.join(self.profile_result_path, "total.json"), "r") as f:
-                profile_result = json.load(f)
-            T_F_list = profile_result["T_F"]
-            mean_T_F = np.mean(T_F_list)
-            new_cdc_latency = (
-                pp_size
-                * self.pp_schedule.sys_config.num_chunks
-                * mean_T_F
-                * args.cdc_latency_as_F_blocks
+            # start with profile schedule
+            self.pp_schedule = get_default_static_schedule(
+                "ZBH1" if self.dynamic_schedule_type in ["ud", "subud"] else "ZBV",
+                pp_size,
+                num_microbatch,
             )
-            # s -> ms
-            args.cdc_latency = new_cdc_latency * 1000
-            self.cdc_print(
-                f"Adjusted cdc latency: {args.cdc_latency} second, T_F:{mean_T_F}, pp_size:{pp_size}, num_chunks:{self.pp_schedule.sys_config.num_chunks}, cdc_latency_as_F_blocks:{args.cdc_latency_as_F_blocks}"
-            )
+            if self.subblock_scheduling:
+                for dev_task_list in self.pp_schedule.device_scheduled_tasks:
+                    for dev_task in dev_task_list:
+                        dev_task.subpart_start = 0
+                        dev_task.subpart_end = self.num_subparts
+                        dev_task.num_subparts = self.num_subparts
+
+        self.exp_manager = ExperimentManager(
+            args,
+            self.tp_rank,
+            self.dp_rank,
+            self.pp_rank,
+            self.pp_schedule.sys_config.num_chunks,
+            exp_dir=exp_dir,
+        )
+        self.cdc_print(self.exp_manager.print_expertiment_info(), rank=0)
+        
+        if self.tp_rank == 0 and self.dp_rank == 0 and self.pp_rank == 0:
+            self.pp_schedule.print_schedule(name='schedule_init', save=True, save_path=self.exp_manager.profile_result_path)
 
         self.pp_execution_planner = ExecutionPlanner(self.pp_schedule)
         self.pp_execution_planner.generate_execution_plan()
@@ -435,13 +625,17 @@ class CDCPPScheduler:
 
         # cross-DC
         self.num_dc = args.num_dc
-        self.cdc_latency = args.cdc_latency
+        # tuple of (ratio to F stage time, time in seconds)
+        self.injected_latency_delay = (0, 0)
+        self.injected_bandwidth_delay = (0, 0)
 
         # decide whether to insert latency.
         self.cdc_recv_prev = False
         self.cdc_recv_next = False
+        self.cdc_send_prev = False
+        self.cdc_send_next = False
 
-        if self.num_dc > 1 and self.cdc_latency > 0:
+        if self.num_dc > 1:
             self.pp_stages_per_dc = process_pp_stages_per_dc(
                 args.pp_stages_per_dc, pp_size, self.num_dc
             )
@@ -459,6 +653,12 @@ class CDCPPScheduler:
                             and event.type == CommEventType.POST_RECV_NEXT
                         ):
                             self.cdc_recv_next = True
+                        if (
+                            isinstance(event, CommEvent)
+                            and event.type == CommEventType.POST_SEND_NEXT
+                        ):
+                            self.cdc_send_next = True
+                        if self.cdc_recv_next and self.cdc_send_next:
                             break
             if pp_rank in [x % pp_size for x in dc_boundaries]:
                 # check if any recv prev events in the plan
@@ -469,13 +669,18 @@ class CDCPPScheduler:
                             and event.type == CommEventType.POST_RECV_PREV
                         ):
                             self.cdc_recv_prev = True
+                        if (
+                            isinstance(event, CommEvent)
+                            and event.type == CommEventType.POST_SEND_PREV
+                        ):
+                            self.cdc_send_prev = True
+                        if self.cdc_recv_prev and self.cdc_send_prev:
                             break
             self.cdc_print(
-                f"latency injection: cdc_recv_prev: {self.cdc_recv_prev}, cdc_recv_next: {self.cdc_recv_next}"
+                f"delay injection: recv_prev {self.cdc_recv_prev}, recv_next {self.cdc_recv_next}, send_prev {self.cdc_send_prev}, send_next {self.cdc_send_next}",
             )
 
-        if self.enable_cdc_profile:
-            self.cdc_comm_profiles = self.pp_benchmark()
+        self.exp_manager.cdc_comm_profiles = self.pp_benchmark()
 
         self.wgrad_split = any(
             [task.task_desc.type == "W" for task in self.pp_execution_plan_cur_device]
@@ -504,53 +709,93 @@ class CDCPPScheduler:
 
         self.validate_args()
 
-        self.exp_logging = args.cdc_exp_logging
-        if self.tp_rank != 0 or self.dp_rank != 0 or self.pp_rank != 0:
-            self.exp_logging_my_rank = False
-        else:
-            self.exp_logging_my_rank = True
-        self.exp_logging_path = args.tensorboard_dir
-        self.exp_logging_start_iter = 2
-        self.exp_logging_end_iter = args.exit_interval - 1
-        self.exp_logging_iter_time = defaultdict(list)
-        self.exp_logging_max_allocated_mem = defaultdict(list)
-        self.cdc_exp_override_latency = False
-        self.cdc_exp_dump_execution_plan = args.cdc_exp_dump_execution_plan
-        self.cdc_exp_override_latency_ms = args.cdc_exp_override_latency_ms
-        self.cdc_exp_override_latency_test_iters = (
-            args.cdc_exp_override_latency_test_iters
+        if self.exp_manager.dump_execution_plan_on_this_rank():
+            with open(
+                os.path.join(
+                    self.exp_manager.profile_result_path, "exec_plan_init.log"
+                ),
+                "w",
+            ) as f:
+                f.write(self.pp_execution_planner.print_execution_plan())
+
+    def update_schedule_with_latency_bandwidth(self):
+        if self.exp_manager.profile_result is None:
+            return
+        latency_sec, bandwidth_sec = (
+            self.exp_manager.get_injected_latency_bandwidth_delay_seconds()
         )
-        # if self.exp_logging:
-        #     assert self.exp_logging_start_iter + 10 < self.exp_logging_end_iter
+        latency_as_F_stage, bandwidth_as_F_stage = (
+            self.exp_manager.get_injected_latency_bandwidth_delay_as_F_stage()
+        )
+        if not self.exp_manager.need_schedule_update_in_current_iter():
+            return
+        self.injected_latency_delay = (latency_as_F_stage, latency_sec)
+        self.injected_bandwidth_delay = (bandwidth_as_F_stage, bandwidth_sec)
+        self.cdc_print(
+            f"Delay Config Update: latency {latency_as_F_stage} F stage, {latency_sec} seconds; bandwidth {bandwidth_as_F_stage} F stage, {bandwidth_sec} seconds",
+            rank=0,
+        )
+        
+        estimated_runtime = 0
 
-        if len(self.cdc_exp_override_latency_ms) > 0:
-            self.cdc_exp_override_latency = True
-            assert not args.cdc_latency_as_F_blocks
-            # if iter = <> then change latency.
-            self.cdc_exp_override_iter = [
-                2 + i * self.cdc_exp_override_latency_test_iters
-                for i in range(len(self.cdc_exp_override_latency_ms))
-            ]
-            self.exp_logging_end_iter = (
-                self.cdc_exp_override_iter[-1]
-                + self.cdc_exp_override_latency_test_iters
-            )
-            args.exit_interval = self.exp_logging_end_iter + 1
-            
-        if self.cdc_exp_dump_execution_plan:
-            if self.exp_logging_my_rank:
-                with open(
-                    os.path.join(self.profile_result_path, "exec_plan_init.log"), "w"
-                ) as f:
-                    f.write(self.pp_execution_planner.print_execution_plan())
-
-    def update_schedule_with_latency(self, latency_ms):
         if self.use_static_schedule:
-            self.cdc_latency = latency_ms
+            with open(os.path.join(self.exp_manager.profile_result_path, "total.json"), "r") as f:
+                profile_result = json.load(f)
+            T_F_list = profile_result["T_F"]
+            T_B_list = profile_result["T_B"]
+            T_W_list = profile_result["T_W"]
+            M_F_list = profile_result["M_F"]
+            M_B_list = profile_result["M_B"]
+            M_W_list = profile_result["M_W"]
+            M_Limit_list = profile_result["M_Limit"]
+            pp_size = self.args.pipeline_model_parallel_size
+            new_latency_matrix = np.zeros((pp_size, pp_size))
+            new_bandwidth_matrix = np.zeros((pp_size, pp_size))
+            
+            pp_stages_per_dc = process_pp_stages_per_dc(
+                self.args.pp_stages_per_dc, pp_size, self.args.num_dc
+            )
+            dc_boundaries = [
+                sum(pp_stages_per_dc[:i]) for i in range(1, self.args.num_dc + 1)
+            ]
+            for boundary in dc_boundaries:
+                src = (boundary - 1) % pp_size
+                dst = boundary % pp_size
+                new_latency_matrix[src, dst] = latency_sec
+                new_latency_matrix[dst, src] = latency_sec
+                new_bandwidth_matrix[src, dst] = bandwidth_sec
+                new_bandwidth_matrix[dst, src] = bandwidth_sec
+            sys_cfg = SystemConfig(
+                T_F=T_F_list,
+                T_B=T_B_list,
+                T_C=new_latency_matrix,
+                T_beta=new_bandwidth_matrix,
+                T_W=T_W_list,
+                M_F=M_F_list,
+                M_B=M_B_list,
+                M_W=M_W_list,
+                M_Limit=M_Limit_list,
+                num_devices=pp_size,
+                num_microbatches=self.num_microbatch,
+                num_chunks=self.pp_schedule.sys_config.num_chunks,
+                two_dc=False,                
+            )
+            pipeline = get_default_static_schedule(
+                self.args.static_schedule, pp_size, self.num_microbatch, not_to_solve_deps=True
+            )
+            pipeline.sys_config = sys_cfg
+            pipeline.solve_dependencies()
+            estimated_runtime = pipeline.get_schedule_time(device_wise=True)          
+            self.pp_schedule = pipeline 
+
         else:
             # dynamic schedule
-            self.pp_schedule_generator.update_latency_ms(latency_ms)
-            self.pp_schedule = self.pp_schedule_generator.get_schedule()
+            self.pp_schedule_generator.update_latency_bandwidth_seconds(
+                self.injected_latency_delay[1], self.injected_bandwidth_delay[1]
+            )
+            self.pp_schedule, estimated_runtime = self.pp_schedule_generator.get_schedule()
+            
+        if (self.use_static_schedule and self.args.enable_prefetch_opt) or self.use_dynamic_schedule:
             self.pp_execution_planner = ExecutionPlanner(self.pp_schedule)
             self.pp_execution_planner.generate_execution_plan()
             self.pp_execution_plan: List[List[ComputeTask]] = (
@@ -560,20 +805,27 @@ class CDCPPScheduler:
             self.pp_execution_plan_cur_device: List[ComputeTask] = (
                 self.pp_execution_plan[self.pp_rank]
             )
+            
+            # self.pp_schedule.print_schedule(name=f'schedule_lat{latency_as_F_stage}_bw{bandwidth_as_F_stage}', save=True, save_path=self.exp_manager.profile_result_path)
 
             self.cdc_print(
                 f"updated execution_plan: \n {self.pp_execution_planner.print_execution_plan()}",
                 rank=0,
                 verbose=2,
             )
-            if self.cdc_exp_dump_execution_plan:
-                if self.exp_logging_my_rank:
-                    with open(
-                        os.path.join(self.profile_result_path, f"exec_plan_lat_{latency_ms}.log"),
-                        "w",) as f:
-                        f.write(self.pp_execution_planner.print_execution_plan())
-                        
-            self.cdc_latency = latency_ms
+            if self.exp_manager.dump_execution_plan_on_this_rank():
+                with open(
+                    os.path.join(
+                        self.exp_manager.profile_result_path,
+                        f"exec_plan_lat{latency_as_F_stage}_bw{bandwidth_as_F_stage}.log",
+                    ),
+                    "w",
+                ) as f:
+                    f.write(self.pp_execution_planner.print_execution_plan())
+
+        dist.barrier()
+        
+        self.exp_manager.exp_logging_perf_model_iter_time[(self.injected_latency_delay, self.injected_bandwidth_delay)] = estimated_runtime
 
     def clean_up(self):
         # get ready for the next iteration
@@ -655,6 +907,7 @@ class CDCPPScheduler:
     def get_num_layers_in_chunk(self, dev_id=None, chunk_id=None):
         # TODO: better model splitting
         # now we treat vocab and lm head as one layer each. and add unbalanced layers to last several chunks
+        assert self.args.head_tail_as_one_layer
         num_layer = self.args.num_layers
         if self.args.head_tail_as_one_layer:
             num_layer = num_layer - 2
@@ -732,12 +985,6 @@ class CDCPPScheduler:
                 tensor_shape,
             )
 
-        # block only when benchmarking runtime
-        block_host_till_comm_finish = (
-            self.enable_cdc_profile
-            and self.args.curr_iteration == self.args.cdc_profile_iter
-        )
-
         if event.type == CommEventType.LOCAL_COPY:
             if event.task_type == "F":
                 with torch.no_grad():
@@ -755,19 +1002,39 @@ class CDCPPScheduler:
                     )
         elif event.type == CommEventType.POST_SEND_NEXT:
             self.send_next_reqs[(event.mb_id, event.chunk_id, event.task_type)] = (
-                self.isend(send_buffer, next_rank, group=send_next_group)
+                self.isend(
+                    send_buffer,
+                    next_rank,
+                    group=send_next_group,
+                    bandwidth_delay_ms=self.injected_bandwidth_delay[1] * 1000 if self.cdc_send_next else 0,
+                )
             )
         elif event.type == CommEventType.POST_RECV_NEXT:
             self.recv_next_reqs[(event.mb_id, event.chunk_id, event.task_type)] = (
-                self.irecv(recv_buffer, next_rank, group=recv_next_group)
+                self.irecv(
+                    recv_buffer,
+                    next_rank,
+                    group=recv_next_group,
+                    bandwidth_delay_ms=self.injected_bandwidth_delay[1] * 1000 if self.cdc_recv_next else 0,
+                )
             )
         elif event.type == CommEventType.POST_SEND_PREV:
             self.send_prev_reqs[(event.mb_id, event.chunk_id, event.task_type)] = (
-                self.isend(send_buffer, prev_rank, group=send_prev_group)
+                self.isend(
+                    send_buffer,
+                    prev_rank,
+                    group=send_prev_group,
+                    bandwidth_delay_ms=self.injected_bandwidth_delay[1] * 1000 if self.cdc_send_prev else 0,
+                )
             )
         elif event.type == CommEventType.POST_RECV_PREV:
             self.recv_prev_reqs[(event.mb_id, event.chunk_id, event.task_type)] = (
-                self.irecv(recv_buffer, prev_rank, group=recv_prev_group)
+                self.irecv(
+                    recv_buffer,
+                    prev_rank,
+                    group=recv_prev_group,
+                    bandwidth_delay_ms=self.injected_bandwidth_delay[1] * 1000 if self.cdc_recv_prev else 0,
+                )
             )
         elif event.type == CommEventType.WAIT_SEND_NEXT:
             handle = self.send_next_reqs[(event.mb_id, event.chunk_id, event.task_type)]
@@ -776,16 +1043,17 @@ class CDCPPScheduler:
         elif event.type == CommEventType.WAIT_RECV_NEXT:
             handle = self.recv_next_reqs[(event.mb_id, event.chunk_id, event.task_type)]
             assert handle is not None
+            # handle.wait()
             assert hasattr(
-                handle, "wait_with_delay_in_ms"
-            ), "Latency injection requires custom pytorch build for wait_with_delay_in_ms"
+                handle, "wait_with_lat_delay_in_ms"
+            ), "Latency injection requires custom pytorch build for wait_with_lat_delay_in_ms"
             if self.cdc_recv_next:
-                handle.wait_with_delay_in_ms(timedelta(milliseconds=self.cdc_latency))
+                # if only bandwidth delay injection, still need this api to inject spin kernel on default stream.
+                handle.wait_with_lat_delay_in_ms(
+                    timedelta(milliseconds=self.injected_latency_delay[1] * 1000)
+                )
             else:
-                if block_host_till_comm_finish:
-                    handle.wait_with_delay_in_ms(timedelta(milliseconds=0))
-                else:
-                    handle.wait()
+                handle.wait()
         elif event.type == CommEventType.WAIT_SEND_PREV:
             handle = self.send_prev_reqs[(event.mb_id, event.chunk_id, event.task_type)]
             assert handle is not None
@@ -793,16 +1061,17 @@ class CDCPPScheduler:
         elif event.type == CommEventType.WAIT_RECV_PREV:
             handle = self.recv_prev_reqs[(event.mb_id, event.chunk_id, event.task_type)]
             assert handle is not None
+            # handle.wait()
             assert hasattr(
-                handle, "wait_with_delay_in_ms"
-            ), "Latency injection requires custom pytorch build for wait_with_delay_in_ms"
+                handle, "wait_with_lat_delay_in_ms"
+            ), "Latency injection requires custom pytorch build for wait_with_lat_delay_in_ms"
             if self.cdc_recv_prev:
-                handle.wait_with_delay_in_ms(timedelta(milliseconds=self.cdc_latency))
+                # if only bandwidth delay injection, still need this api to inject spin kernel on default stream.
+                handle.wait_with_lat_delay_in_ms(
+                    timedelta(milliseconds=self.injected_latency_delay[1] * 1000)
+                )
             else:
-                if block_host_till_comm_finish:
-                    handle.wait_with_delay_in_ms(timedelta(milliseconds=0))
-                else:
-                    handle.wait()
+                handle.wait()
         else:
             raise NotImplementedError()
 
@@ -840,6 +1109,8 @@ class CDCPPScheduler:
                 pre_event, config, tensor_shape, forward_only, num_microbatches
             )
 
+
+        _ = torch.empty(1, device=torch.cuda.current_device()) + 1
         task_type = compute_task.task_desc.type
         chunk_id = compute_task.task_desc.chunk_id
         mb_id = compute_task.task_desc.mb_id
@@ -851,12 +1122,9 @@ class CDCPPScheduler:
 
         task_type_to_int = {"F": 0, "B": 1, "W": 2}
 
-        if (
-            self.enable_cdc_profile
-            and self.args.curr_iteration == self.args.cdc_profile_iter
-        ):
-            if self.cdc_base_memory < 0:
-                self.cdc_base_memory = torch.cuda.memory_allocated(
+        if self.exp_manager.profile_in_current_iter():
+            if self.exp_manager.cdc_base_memory < 0:
+                self.exp_manager.cdc_base_memory = torch.cuda.memory_allocated(
                     device=torch.cuda.current_device()
                 )
             # sync default stream
@@ -866,105 +1134,217 @@ class CDCPPScheduler:
             torch.cuda.default_stream(torch.cuda.current_device()).synchronize()
             time_before = time.perf_counter()
 
-        if (
-            self.exp_logging_my_rank
-            and self.exp_logging_first_mb
-            and self.args.curr_iteration >= self.exp_logging_start_iter
-        ):
+        if self.exp_manager.record_schedule_start_in_current_iter():
+            assert (
+                not self.exp_manager.profile_in_current_iter()
+            ), "No profiling when benchmarking schedule runtime"
             # start timing before first compute task
-            torch.cuda.synchronize()
-            self.exp_logging_iter_time[self.cdc_latency].append(time.perf_counter())
+            torch.cuda.default_stream(torch.cuda.current_device()).synchronize()
+            self.exp_manager.exp_logging_iter_time[
+                (self.injected_latency_delay, self.injected_bandwidth_delay)
+            ].append(time.perf_counter())
 
         if task_type == "F" and (not forward_only or mb_id < num_microbatches):
-            self.cdc_print(
-                f"forward_step mb_id: {mb_id}, chunk_id: {chunk_id}", verbose=2
-            )
-            self.output_tensors[(mb_id, chunk_id)], num_tokens = forward_step(
-                forward_step_func=forward_step_func,
-                data_iterator=data_iterator[chunk_id],
-                model=model[chunk_id],
-                num_microbatches=num_microbatches,
-                input_tensor=self.input_tensors[(mb_id, chunk_id)]
-                if not is_first_stage
-                else None,
-                forward_data_store=forward_data_store,
-                config=config,
-                collect_non_loss_data=collect_non_loss_data,
-                checkpoint_activations_microbatch=None,  # max_outstanding_backprops, num_microbatches_with_partial_activation_checkpoints
-                is_first_microbatch=check_first_val_step(
-                    first_val_step, forward_only, mb_id == 0
-                ),
-                current_microbatch=mb_id,
-                encoder_decoder_xattn=False,
-            )
-            self.total_num_tokens += num_tokens.item()
-            # The following is buggy. crossdc: TODO: another way to deallocate?
-            # if is_last_stage:
-            #     # no need to cache output tensor at last stage
-            #     self.output_tensors[(mb_id, chunk_id)] = None
+            if not self.subblock_scheduling:
+                self.cdc_print(
+                    f"forward_step mb_id: {mb_id}, chunk_id: {chunk_id}", verbose=2
+                )
+            else:
+                self.cdc_print(
+                    f"forward_step mb_id: {mb_id}, chunk_id: {chunk_id}, subpart: {compute_task.task_desc.subpart_start}-{compute_task.task_desc.subpart_end}",
+                    verbose=2,
+                )
+            
+            with nvtx.range(f"Dev{self.pp_rank} F: {mb_id} chunk: {chunk_id}"):
+                if not self.subblock_scheduling:
+                    self.output_tensors[(mb_id, chunk_id)], num_tokens = forward_step(
+                        forward_step_func=forward_step_func,
+                        data_iterator=data_iterator[chunk_id],
+                        model=model[chunk_id],
+                        num_microbatches=num_microbatches,
+                        input_tensor=self.input_tensors[(mb_id, chunk_id)]
+                        if not is_first_stage
+                        else None,
+                        forward_data_store=forward_data_store,
+                        config=config,
+                        collect_non_loss_data=collect_non_loss_data,
+                        checkpoint_activations_microbatch=None,  # max_outstanding_backprops, num_microbatches_with_partial_activation_checkpoints
+                        is_first_microbatch=check_first_val_step(
+                            first_val_step, forward_only, mb_id == 0
+                        ),
+                        current_microbatch=mb_id,
+                        encoder_decoder_xattn=False,
+                    )
+                    self.total_num_tokens += num_tokens.item()
+                    # The following is buggy. crossdc: TODO: another way to deallocate?
+                    # if is_last_stage:
+                    #     # no need to cache output tensor at last stage
+                    #     self.output_tensors[(mb_id, chunk_id)] = None
+                else:
+                    subpart_start = compute_task.task_desc.subpart_start
+                    subpart_end = compute_task.task_desc.subpart_end
+                    num_subparts = compute_task.task_desc.num_subparts
+                    for subpart_idx in range(subpart_start, subpart_end):
+                        first_subpart = subpart_idx == 0
+                        last_subpart = subpart_idx == num_subparts - 1
+                        output, token = forward_step_subblock(
+                            subpart_idx=subpart_idx,
+                            num_subparts=num_subparts,
+                            microbatch_idx=mb_id,
+                            forward_step_func=forward_step_func,
+                            data_iterator=data_iterator[chunk_id],
+                            model=model[chunk_id],
+                            num_microbatches=num_microbatches,
+                            input_tensor=self.input_tensors[(mb_id, chunk_id)] if (not is_first_stage and first_subpart) else None,
+                            forward_data_store=forward_data_store,
+                            config=config,
+                            collect_non_loss_data=collect_non_loss_data,
+                            checkpoint_activations_microbatch=None,  # max_outstanding_backprops, num_microbatches_with_partial_activation_checkpoints
+                            is_first_microbatch=check_first_val_step(
+                                first_val_step, forward_only, mb_id == 0
+                            ),
+                            current_microbatch=mb_id,
+                        )
+                        if last_subpart:
+                            self.output_tensors[(mb_id, chunk_id)] = output
+                            self.total_num_tokens += token.item()
 
         elif task_type == "B" and not forward_only:
             # Only training. In eval, we skip backward.
 
-            self.cdc_print(
-                f"backward_step mb_id: {mb_id}, chunk_id: {chunk_id}", verbose=2
-            )
-            # enable grad sync for the last microbatch
-            if self._is_last_microbatch_for_model_chunk(compute_task, num_microbatches):
-                self.enable_grad_sync()
+            if not self.subblock_scheduling:
+                self.cdc_print(
+                    f"backward_step mb_id: {mb_id}, chunk_id: {chunk_id}", verbose=2
+                )
+            else:
+                self.cdc_print(
+                    f"backward_step mb_id: {mb_id}, chunk_id: {chunk_id}, subpart: {compute_task.task_desc.subpart_start}-{compute_task.task_desc.subpart_end}",
+                    verbose=2,
+                )
+            with nvtx.range(f"Dev{self.pp_rank} B: {mb_id} chunk: {chunk_id}"):
+                # enable grad sync for the last microbatch
+                if self._is_last_microbatch_for_model_chunk(
+                    compute_task, num_microbatches
+                ):
+                    self.enable_grad_sync()
 
-            output_tensor_grad = (
-                self.output_tensor_grads[(mb_id, chunk_id)]
-                if not is_last_stage
-                else None
-            )
-            self.input_tensor_grads[(mb_id, chunk_id)] = backward_step(
-                input_tensor=self.input_tensors[(mb_id, chunk_id)],
-                output_tensor=self.output_tensors[(mb_id, chunk_id)],
-                output_tensor_grad=output_tensor_grad,
-                model_type=get_model_type(model[chunk_id]),
-                config=config,
-            )
-            # release tensors
-            self.input_tensors[(mb_id, chunk_id)] = None
-            self.output_tensors[(mb_id, chunk_id)] = None
-            self.output_tensor_grads[(mb_id, chunk_id)] = None
+                if not self.subblock_scheduling:                    
+                    output_tensor_grad = (
+                        self.output_tensor_grads[(mb_id, chunk_id)]
+                        if not is_last_stage
+                        else None
+                    )
+                    self.input_tensor_grads[(mb_id, chunk_id)] = backward_step(
+                        input_tensor=self.input_tensors[(mb_id, chunk_id)],
+                        output_tensor=self.output_tensors[(mb_id, chunk_id)],
+                        output_tensor_grad=output_tensor_grad,
+                        model_type=get_model_type(model[chunk_id]),
+                        config=config,
+                    )
+                    # release tensors
+                    self.input_tensors[(mb_id, chunk_id)] = None
+                    self.output_tensors[(mb_id, chunk_id)] = None
+                    self.output_tensor_grads[(mb_id, chunk_id)] = None
 
-            if is_first_stage:
-                self.input_tensor_grads[(mb_id, chunk_id)] = None
+                    if is_first_stage:
+                        self.input_tensor_grads[(mb_id, chunk_id)] = None
 
-            if self.wgrad_store is not None:
-                self.wgrad_store.finish_collection_wgrad_block()
+                    if self.wgrad_store is not None:
+                        self.wgrad_store.finish_collection_wgrad_block()
 
-            # disable grad sync for other microbatches
-            if self._is_last_microbatch_for_model_chunk(compute_task, num_microbatches):
-                self.disable_grad_sync()
+                    # disable grad sync for other microbatches
+                    if self._is_last_microbatch_for_model_chunk(
+                        compute_task, num_microbatches
+                    ):
+                        self.disable_grad_sync()
+                else:
+                    num_subparts = compute_task.task_desc.num_subparts
+                    subpart_start = num_subparts - compute_task.task_desc.subpart_start - 1
+                    subpart_end = num_subparts - compute_task.task_desc.subpart_end - 1
+                    
+                    for subpart_idx in range(subpart_start, subpart_end, -1):
+                        first_subpart = subpart_idx == 0
+                        last_subpart = subpart_idx == num_subparts - 1
+                        output_tensor_grad = (
+                            self.output_tensor_grads[(mb_id, chunk_id)]
+                            if last_subpart and not is_last_stage
+                            else None
+                        )
+                        input_grad = backward_step_subblock(
+                            subpart_idx=subpart_idx,
+                            num_subparts=num_subparts,
+                            microbatch_idx=mb_id,
+                            model=model[chunk_id],
+                            input_tensor=self.input_tensors[(mb_id, chunk_id)] if first_subpart else None,
+                            output_tensor=self.output_tensors[(mb_id, chunk_id)] if last_subpart else None,
+                            output_tensor_grad=output_tensor_grad,
+                            config=config,
+                        )
+                        if first_subpart:
+                            self.input_tensor_grads[(mb_id, chunk_id)] = input_grad
+                        
+                            # release tensors
+                            self.input_tensors[(mb_id, chunk_id)] = None
+                            self.output_tensors[(mb_id, chunk_id)] = None
+                            self.output_tensor_grads[(mb_id, chunk_id)] = None
+
+                            if is_first_stage:
+                                self.input_tensor_grads[(mb_id, chunk_id)] = None
+
+                            if self.wgrad_store is not None:
+                                self.wgrad_store.finish_collection_wgrad_block()
+
+                    # disable grad sync for other microbatches
+                    if self._is_last_microbatch_for_model_chunk(
+                        compute_task, num_microbatches
+                    ):
+                        self.disable_grad_sync()
 
         elif task_type == "W" and not forward_only:
             assert self.wgrad_store is not None
 
-            self.cdc_print(
-                f"wgrad_step mb_id: {mb_id}, chunk_id: {chunk_id}", verbose=2
-            )
+            if not self.subblock_scheduling:
+                self.cdc_print(
+                    f"wgrad_step mb_id: {mb_id}, chunk_id: {chunk_id}", verbose=2
+                )
+            else:
+                self.cdc_print(
+                    f"wgrad_step mb_id: {mb_id}, chunk_id: {chunk_id}, subpart: {compute_task.task_desc.subpart_start}-{compute_task.task_desc.subpart_end}",
+                    verbose=2,
+                )
+            with nvtx.range(f"Dev{self.pp_rank} W: {mb_id} chunk: {chunk_id}"):
+                if not self.subblock_scheduling:
+                    self.wgrad_store.compute_wgrad_block()
+                    if self._is_last_microbatch_for_model_chunk(
+                        compute_task, num_microbatches
+                    ):
+                        # TODO: I guess enable_grad_sync would not enable DP comm here.
+                        # So, we need to do it manually.
+                        model_chunk = model[chunk_id]
+                        assert hasattr(model_chunk, "finish_grad_sync")
+                        model_chunk.finish_grad_sync()
+                else:
+                    num_subparts = compute_task.task_desc.num_subparts
+                    subpart_start = compute_task.task_desc.subpart_start
+                    subpart_end = compute_task.task_desc.subpart_end
+                    self.wgrad_store.compute_wgrad_subblock(subpart_end-subpart_start, num_subparts)
+                    last_subpart = subpart_end == num_subparts
+                    if last_subpart and self._is_last_microbatch_for_model_chunk(
+                        compute_task, num_microbatches
+                    ):
+                        # TODO: I guess enable_grad_sync would not enable DP comm here.
+                        # So, we need to do it manually.
+                        model_chunk = model[chunk_id]
+                        assert hasattr(model_chunk, "finish_grad_sync")
+                        model_chunk.finish_grad_sync()
 
-            self.wgrad_store.compute_wgrad_block()
 
-            if self._is_last_microbatch_for_model_chunk(compute_task, num_microbatches):
-                # TODO: I guess enable_grad_sync would not enable DP comm here.
-                # So, we need to do it manually.
-                model_chunk = model[chunk_id]
-                assert hasattr(model_chunk, "finish_grad_sync")
-                model_chunk.finish_grad_sync()
-
-        if (
-            self.enable_cdc_profile
-            and self.args.curr_iteration == self.args.cdc_profile_iter
-        ):
+        if self.exp_manager.profile_in_current_iter():
             # sync default stream
             torch.cuda.default_stream(torch.cuda.current_device()).synchronize()
             time_after = time.perf_counter()
             mem_after = torch.cuda.memory_allocated(device=torch.cuda.current_device())
-            self.cdc_compute_profile_dict[
+            self.exp_manager.cdc_compute_profile_dict[
                 (mb_id, chunk_id, task_type_to_int[task_type])
             ] = [
                 time_after - time_before,
@@ -1086,16 +1466,13 @@ class CDCPPScheduler:
             [get_model_type(chunk) != ModelType.encoder_and_decoder for chunk in model]
         )
 
-        if (
-            self.enable_cdc_profile
-            and self.args.curr_iteration == self.args.cdc_profile_iter
-        ):
-            if len(self.cdc_chunk_parameters) == 0:
+        if self.exp_manager.profile_in_current_iter():
+            if len(self.exp_manager.cdc_chunk_parameters) == 0:
                 for chunk_id, chunk in enumerate(model):
                     assert len(model) == self.pp_schedule.sys_config.num_chunks
                     # get number
                     num_params = sum(p.numel() for p in chunk.parameters())
-                    self.cdc_chunk_parameters[chunk_id] = num_params
+                    self.exp_manager.cdc_chunk_parameters[chunk_id] = num_params
                     self.cdc_print(
                         f"model info: chunk {chunk_id} has {num_params} parameters"
                     )
@@ -1104,7 +1481,7 @@ class CDCPPScheduler:
                     )
 
             for chunk_id in range(self.pp_schedule.sys_config.num_chunks):
-                if chunk_id not in self.cdc_layer_info:
+                if chunk_id not in self.exp_manager.cdc_layer_info:
                     first_stage_rank = self.pp_schedule.get_pipeline_first_stage_rank()
                     last_stage_rank = self.pp_schedule.get_pipeline_last_stage_rank()
                     cur_chunk_has_vocab_embedding = (
@@ -1117,7 +1494,7 @@ class CDCPPScheduler:
                     num_layers = self.get_num_layers_in_chunk(
                         dev_id=self.pp_rank, chunk_id=chunk_id
                     )
-                    self.cdc_layer_info[chunk_id] = (
+                    self.exp_manager.cdc_layer_info[chunk_id] = (
                         cur_chunk_has_vocab_embedding,
                         cur_chunk_has_lm_head,
                         num_layers,
@@ -1156,21 +1533,11 @@ class CDCPPScheduler:
             * torch.tensor([], dtype=config.pipeline_dtype).element_size()
         )
 
-        if self.cdc_exp_override_latency and len(self.cdc_exp_override_iter) > 0:
-            if self.args.curr_iteration == self.cdc_exp_override_iter[0]:
-                self.update_schedule_with_latency(self.cdc_exp_override_latency_ms[0])
-                self.cdc_exp_override_iter.pop(0)
-                self.cdc_exp_override_latency_ms.pop(0)
-
-        if self.exp_logging:
-            dist.barrier()
+        self.update_schedule_with_latency_bandwidth()
 
         for idx, compute_task in enumerate(self.pp_execution_plan_cur_device):
             # self.cdc_print(f"compute_task: {compute_task}")
-            self.exp_logging_first_mb = False
-            if self.exp_logging_my_rank:
-                if idx == 0:
-                    self.exp_logging_first_mb = True
+            self.exp_manager.exp_logging_first_mb = True if idx == 0 else False
             self.schedule_compute_task(
                 compute_task=compute_task,
                 model=model,
@@ -1202,29 +1569,32 @@ class CDCPPScheduler:
                 self.total_num_tokens if config.calculate_per_token_loss else None,
             )
 
-        if (
-            self.enable_cdc_profile
-            and self.args.curr_iteration == self.args.cdc_profile_iter
-        ):
+        if self.exp_manager.profile_in_current_iter():
             # write profile result
-            if self.cdc_log_profile:
+            if self.exp_manager.cdc_log_profile:
                 self.cdc_print(
-                    f"cdc_compute_profile_dict: {self.cdc_compute_profile_dict}"
+                    f"cdc_compute_profile_dict: {self.exp_manager.cdc_compute_profile_dict}"
                 )
                 if self.pp_rank == 0:
-                    self.cdc_print(f"cdc_comm_profiles: {self.cdc_comm_profiles}")
-                self.cdc_print(f"cdc_base_memory: {self.cdc_base_memory}")
-                self.cdc_print(f"cdc_chunk_parameters: {self.cdc_chunk_parameters}")
-                self.cdc_print(f"cdc_layer_info: {self.cdc_layer_info}")
+                    self.cdc_print(
+                        f"cdc_comm_profiles: {self.exp_manager.cdc_comm_profiles}"
+                    )
+                self.cdc_print(f"cdc_base_memory: {self.exp_manager.cdc_base_memory}")
+                self.cdc_print(
+                    f"cdc_chunk_parameters: {self.exp_manager.cdc_chunk_parameters}"
+                )
+                self.cdc_print(f"cdc_layer_info: {self.exp_manager.cdc_layer_info}")
 
-                with open(self.profile_result_file, "w") as f:
+                with open(self.exp_manager.profile_result_rank_file, "w") as f:
                     json.dump(
                         {
-                            "compute": tuple_keys_to_str(self.cdc_compute_profile_dict),
-                            "comm": self.cdc_comm_profiles,
-                            "base_mem": self.cdc_base_memory,
-                            "params": self.cdc_chunk_parameters,
-                            "layer_info": self.cdc_layer_info,
+                            "compute": tuple_keys_to_str(
+                                self.exp_manager.cdc_compute_profile_dict
+                            ),
+                            "comm": self.exp_manager.cdc_comm_profiles,
+                            "base_mem": self.exp_manager.cdc_base_memory,
+                            "params": self.exp_manager.cdc_chunk_parameters,
+                            "layer_info": self.exp_manager.cdc_layer_info,
                         },
                         f,
                     )
@@ -1233,7 +1603,7 @@ class CDCPPScheduler:
 
             # rank 0 concludes the profile result
             if dist.get_rank() == 0:
-                json_file_path = self.profile_result_path
+                json_file_path = self.exp_manager.profile_result_path
                 json_results = []
                 pp_size = parallel_state.get_pipeline_model_parallel_world_size()
                 for i in range(pp_size):
@@ -1245,6 +1615,7 @@ class CDCPPScheduler:
                 T_B_list = []
                 T_W_list = []
                 T_C_matrix = np.zeros((pp_size, pp_size))
+                T_bw_matrix = np.zeros((pp_size, pp_size))
                 M_F_list = []
                 M_B_list = []
                 M_W_list = []
@@ -1263,17 +1634,16 @@ class CDCPPScheduler:
                         compute_time, mem_before, mem_after = value
                         T_cur_dev[cur_type].append(compute_time)
                         M_cur_dev[cur_type].append(mem_after - mem_before)
-                    # use min val, since gpu is highy async.
                     # crossdc: TODO: currently we do not differentiate chunks in ppsim
                     T_F_list.append(np.min(T_cur_dev[0]))
                     T_B_list.append(np.min(T_cur_dev[1]))
                     if len(T_cur_dev[2]) > 0:
-                        T_W_list.append(np.min(T_cur_dev[2]))
+                        T_W_list.append(np.median(T_cur_dev[2])) # due to subblock scheduling, W time varies, some may close to 0.
                     else:
                         T_W_list.append(0)
-                    M_F_list.append(np.percentile(M_cur_dev[0], 75))
+                    M_F_list.append(np.median(M_cur_dev[0]))
                     if len(M_cur_dev[2]) > 0:
-                        M_W_list.append(np.percentile(M_cur_dev[2], 75))
+                        M_W_list.append(np.median(M_cur_dev[2]))
                     else:
                         M_W_list.append(0)
                     M_B_list.append(-M_F_list[-1] - M_W_list[-1])
@@ -1284,15 +1654,15 @@ class CDCPPScheduler:
                 ]["comm"]
                 message_size = self.pp_comm_size_bytes
                 for i in range(pp_size):
-                    T_C_matrix[i, (i + 1) % pp_size] = (
-                        alpha_to_next[i] + beta_to_next[i] * message_size
-                    )
-                    T_C_matrix[i, (i - 1) % pp_size] = (
-                        alpha_to_prev[i] + beta_to_prev[i] * message_size
-                    )
+                    T_C_matrix[i, (i + 1) % pp_size] = alpha_to_next[i]
+                    T_bw_matrix[i, (i + 1) % pp_size] = beta_to_next[i] * message_size
+                    T_C_matrix[i, (i - 1) % pp_size] = alpha_to_prev[i]
+                    T_bw_matrix[i, (i - 1) % pp_size] = beta_to_prev[i] * message_size
 
                 # make T_C symmetric
                 T_C_matrix = (T_C_matrix + T_C_matrix.T) / 2
+                # make T_bw symmetric
+                T_bw_matrix = (T_bw_matrix + T_bw_matrix.T) / 2
                 with open(os.path.join(json_file_path, "total.json"), "w") as f:
                     json.dump(
                         {
@@ -1300,6 +1670,7 @@ class CDCPPScheduler:
                             "T_B": T_B_list,
                             "T_W": T_W_list,
                             "T_C": T_C_matrix.tolist(),
+                            "T_bw": T_bw_matrix.tolist(),
                             "M_F": M_F_list,
                             "M_B": M_B_list,
                             "M_W": M_W_list,
@@ -1307,25 +1678,28 @@ class CDCPPScheduler:
                         },
                         f,
                     )
+            dist.barrier()
+            self.exp_manager.read_profile_result()
+            if self.pp_schedule_generator is not None:
+                self.pp_schedule_generator.initialize()
 
-        if (
-            self.exp_logging_my_rank
-            and self.args.curr_iteration >= self.exp_logging_start_iter
-        ):
-            torch.cuda.synchronize()
-            self.exp_logging_iter_time[self.cdc_latency][-1] = (
-                time.perf_counter() - self.exp_logging_iter_time[self.cdc_latency][-1]
+        if self.exp_manager.record_schedule_end_in_current_iter():
+            
+            torch.cuda.default_stream(torch.cuda.current_device()).synchronize()
+            self.exp_manager.exp_logging_iter_time[
+                (self.injected_latency_delay, self.injected_bandwidth_delay)
+            ][-1] = (
+                time.perf_counter()
+                - self.exp_manager.exp_logging_iter_time[
+                    (self.injected_latency_delay, self.injected_bandwidth_delay)
+                ][-1]
             )
-            self.exp_logging_max_allocated_mem[self.cdc_latency].append(
-                torch.cuda.max_memory_allocated()
-            )
+            self.exp_manager.exp_logging_max_allocated_mem[
+                (self.injected_latency_delay, self.injected_bandwidth_delay)
+            ].append(torch.cuda.max_memory_allocated())
             torch.cuda.reset_max_memory_allocated()
 
-        if (
-            self.exp_logging
-            and self.exp_logging_my_rank
-            and (self.args.curr_iteration == self.exp_logging_end_iter or (self.cdc_exp_override_latency and len(self.cdc_exp_override_iter) != 0 and self.args.curr_iteration + 1 == self.cdc_exp_override_iter[0]))
-        ):
+        if self.exp_manager.write_to_json_in_current_iter():
             # write to json
             timpstamp = int(time.time())
             schedule = (
@@ -1333,13 +1707,10 @@ class CDCPPScheduler:
                 if self.use_static_schedule
                 else self.args.dynamic_schedule
             )
-            with open(
-                os.path.join(self.exp_logging_path, f"exp_{timpstamp}.json"), "w"
-            ) as f:
-                json.dump(
-                    {
-                        "iter_time": self.exp_logging_iter_time,
-                        "max_mem": self.exp_logging_max_allocated_mem,
+            result_dict = {
+                        "iter_time": tuple_keys_to_str(self.exp_manager.exp_logging_iter_time),
+                        "max_mem": tuple_keys_to_str(self.exp_manager.exp_logging_max_allocated_mem),
+                        "perf_model_time": tuple_keys_to_str(self.exp_manager.exp_logging_perf_model_iter_time),
                         "config": {
                             "schedule": schedule,
                             "TP": self.args.tensor_model_parallel_size,
@@ -1347,17 +1718,34 @@ class CDCPPScheduler:
                             "DP": self.args.data_parallel_size,
                             "seq_len": self.args.seq_length,
                             "GBS": self.args.global_batch_size,
+                            "MBS": self.args.micro_batch_size,
                             "n_DC": self.args.num_dc,
-                            "cdc_latency": self.args.cdc_latency,
-                            "cdc_latency_F_blocks": self.args.cdc_latency_as_F_blocks,
-                            "cdc_actual_latency": self.cdc_latency,
-                            "dyn_mem_factor": self.args.dynamic_mem_factor,
+                            "cdc_delay": self.args.cdc_latency_bandwidth_delay_as_F_stage,
+                            "dyn_extra_mem_factor": self.args.dynamic_extra_mem_factor,
                             "num_layers": self.args.num_layers,
                             "cdc_exp_tf_block_size": self.args.cdc_exp_tf_block_size,
+                            "recomputation": self.args.recompute_granularity is not None,
                         },
-                    },
+                    }
+            with open(
+                os.path.join(
+                    self.exp_manager.exp_logging_path, f"exp_{timpstamp}.json"
+                ),
+                "w",
+            ) as f:
+                json.dump(
+                    result_dict,
                     f,
                 )
+            # also overwrite the final result json if exist
+            with open(
+                os.path.join(self.exp_manager.exp_logging_path, "exp_final.json"), "w"
+            ) as f:
+                json.dump(
+                    result_dict,
+                    f,
+                )
+                
 
         self.clean_up()
 
@@ -1367,21 +1755,52 @@ class CDCPPScheduler:
     def get_forward_backward_func(self):
         return self.forward_backward_func
 
-    def get_cdc_recv_delay(self) -> int | float:
-        return self.cdc_latency
-
     def send(
-        self, tensor: torch.Tensor, dst: int, group: dist.ProcessGroupNCCL | None = None
+        self,
+        tensor: torch.Tensor,
+        dst: int,
+        group: dist.ProcessGroupNCCL | None = None,
+        bandwidth_delay_ms: int = 0,
     ):
-        dist.send(tensor, dst, group=group)
+        prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
+        next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
+        send_prev_group = parallel_state.get_pipeline_extra_send_prev_group()
+        send_next_group = parallel_state.get_pipeline_extra_send_next_group()
+        if (dst == prev_rank and self.cdc_send_prev and group is send_prev_group) or (
+            dst == next_rank and self.cdc_send_next and group is send_next_group
+        ):
+            bandwidth_delay_to_inject = bandwidth_delay_ms
+        else:
+            bandwidth_delay_to_inject = 0
+        dist.send(tensor, dst, group=group, tag=int(bandwidth_delay_to_inject))
+        # dist.send(tensor, dst, group=group, tag=0)
 
     def isend(
-        self, tensor: torch.Tensor, dst: int, group: dist.ProcessGroupNCCL | None = None
+        self,
+        tensor: torch.Tensor,
+        dst: int,
+        group: dist.ProcessGroupNCCL | None = None,
+        bandwidth_delay_ms: int = 0,
     ) -> dist.Work:
-        return dist.isend(tensor, dst, group=group)
+        prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
+        next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
+        send_prev_group = parallel_state.get_pipeline_extra_send_prev_group()
+        send_next_group = parallel_state.get_pipeline_extra_send_next_group()
+        if (dst == prev_rank and self.cdc_send_prev and group is send_prev_group) or (
+            dst == next_rank and self.cdc_send_next and group is send_next_group
+        ):
+            bandwidth_delay_to_inject = bandwidth_delay_ms
+        else:
+            bandwidth_delay_to_inject = 0
+        return dist.isend(tensor, dst, group=group, tag=int(bandwidth_delay_to_inject))
+        # return dist.isend(tensor, dst, group=group, tag=0)
 
     def recv(
-        self, tensor: torch.Tensor, src: int, group: dist.ProcessGroupNCCL | None = None
+        self,
+        tensor: torch.Tensor,
+        src: int,
+        group: dist.ProcessGroupNCCL | None = None,
+        bandwidth_delay_ms: int = 0,
     ):
         prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
         next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
@@ -1390,18 +1809,35 @@ class CDCPPScheduler:
         if (src == prev_rank and self.cdc_recv_prev and group is recv_prev_group) or (
             src == next_rank and self.cdc_recv_next and group is recv_next_group
         ):
-            work = dist.irecv(tensor, src, group=group)
+            work = dist.irecv(tensor, src, group=group, tag=int(bandwidth_delay_ms))
             assert hasattr(
-                work, "wait_with_delay_in_ms"
-            ), "Latency injection requires custom pytorch build for wait_with_delay_in_ms"
-            work.wait_with_delay_in_ms(timedelta(milliseconds=self.cdc_latency))
+                work, "wait_with_lat_delay_in_ms"
+            ), "Latency injection requires custom pytorch build for wait_with_lat_delay_in_ms"
+            work.wait_with_lat_delay_in_ms(
+                timedelta(milliseconds=self.injected_latency_delay[1] * 1000)
+            )
         else:
-            dist.recv(tensor, src, group=group)
+            dist.recv(tensor, src, group=group, tag=0)
+        # dist.recv(tensor, src, group=group, tag=0)
 
     def irecv(
-        self, tensor: torch.Tensor, src: int, group: dist.ProcessGroupNCCL | None = None
+        self,
+        tensor: torch.Tensor,
+        src: int,
+        group: dist.ProcessGroupNCCL | None = None,
+        bandwidth_delay_ms: int = 0,
     ):
-        return dist.irecv(tensor, src, group=group)
+        prev_rank = parallel_state.get_pipeline_model_parallel_prev_rank()
+        next_rank = parallel_state.get_pipeline_model_parallel_next_rank()
+        recv_prev_group = parallel_state.get_pipeline_extra_recv_prev_group()
+        recv_next_group = parallel_state.get_pipeline_extra_recv_next_group()
+        if (src == prev_rank and self.cdc_recv_prev and group is recv_prev_group) or (
+            src == next_rank and self.cdc_recv_next and group is recv_next_group
+        ):
+            return dist.irecv(tensor, src, group=group, tag=int(bandwidth_delay_ms))
+        else:
+            return dist.irecv(tensor, src, group=group, tag=0)
+        # return dist.irecv(tensor, src, group=group, tag=0)
 
     def cdc_print(self, msg: str, rank=None, verbose=1):
         if verbose > self.cdc_verbose_print:
