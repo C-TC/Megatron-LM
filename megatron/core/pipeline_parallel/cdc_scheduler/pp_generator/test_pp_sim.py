@@ -4,8 +4,11 @@ from .pipeline_config import SystemConfig
 from .auto_schedule import UnidirectionalZBDependencyGraph, WaveLikeZBDependencyGraph
 from .auto_schedule_store import AutoScheduleStore
 from .pipeline import (
-    AutoUDZBPipeline,
+    AutoZBUDPipeline,
     AutoWaveZBPipeline,
+    CPZBLoopPipeline,
+    CPZBUDPipeline,
+    CPZBWavePipeline,
     GpipePipeline,
     Hanayo1F1BPipeline,
     HeuristicWaveZBPipeline,
@@ -18,62 +21,11 @@ from .pipeline import (
     Pipeline,
     ZBH1Pipeline,
 )
+from .subpipeline import DynZBUDSubPipeline, DynZBWaveSubPipeline
 from .simulator import BFSPPSimCfgGen, SimCfgGen
 from .util import generate_comm_mat
 from megatron.core.pipeline_parallel.cdc_scheduler.execution_planner import ExecutionPlanner
 
-
-def test_ud_zb():
-    sys_config = SystemConfig(
-        num_devices=4,
-        num_microbatches=12,
-        T_F=200,
-        T_B=200,
-        T_W=200,
-        T_C=generate_comm_mat(2, 2, 0, 100),
-        M_F=2,
-        M_B=-1,
-        M_W=-1,
-        M_Limit=800,
-    )  # 8
-
-    dg = UnidirectionalZBDependencyGraph(sys_config)
-    dg.build_ilp()
-    dg.solve_ilp(time_limit=20, warm_start=False)
-    schedule = dg.get_schedule()
-
-    azb = AutoUDZBPipeline(sys_config)
-    azb.schedule(schedule)
-    azb.solve_dependencies()
-    azb.print_debug_schedule(verbose=1)
-    azb.print_schedule()
-
-
-def test_wave_zb(relax: bool = False):
-    sys_config = SystemConfig(
-        num_devices=4,
-        num_microbatches=8,
-        num_chunks=2,
-        T_F=100,
-        T_B=100,
-        T_W=100,
-        T_C=0,
-        M_F=2,
-        M_B=-1,
-        M_W=-1,
-        M_Limit=16,
-    )  # 8
-
-    dg = WaveLikeZBDependencyGraph(sys_config, enable_relax=relax)
-    dg.build_ilp()
-    dg.solve_ilp(time_limit=200, warm_start=False)
-    schedule = dg.get_schedule()
-
-    azb = AutoWaveZBPipeline(sys_config)
-    azb.schedule(schedule)
-    azb.solve_dependencies()
-    azb.print_debug_schedule(verbose=1)
-    azb.print_schedule(save=True)
 
 
 def test_schedule_store():
@@ -157,7 +109,7 @@ def test_simulator():
     dg.solve_ilp(time_limit=20, warm_start=False)
     schedule = dg.get_schedule()
 
-    azb = AutoUDZBPipeline(sys_config)
+    azb = AutoZBUDPipeline(sys_config)
     azb.schedule(schedule)
     azb.solve_dependencies()
     azb.print_debug_schedule(verbose=1)
@@ -246,6 +198,7 @@ def test_basic_schedule():
         T_B=T_B_chunk + T_W_chunk,
         T_C=comm_matrix,
         num_chunks=num_chunks,
+        two_dc=False,
     )
 
     zbh1_sys_config = SystemConfig(
@@ -383,11 +336,218 @@ def test_execution_planner_2():
     planner.generate_execution_plan()
     planner.print_execution_plan()
     
+def test_cp_ud_auto_solver():
+    num_dev = 32
+    num_parts = 1
+    sys_config = SystemConfig(
+        num_devices=num_dev,
+        num_microbatches=2*num_dev,
+        T_F=20 * num_parts,
+        T_B=25 * num_parts,
+        T_W=17 * num_parts,
+        T_C=generate_comm_mat(2, num_dev // 2, 0, 30 * num_parts),
+        T_beta=generate_comm_mat(2, num_dev // 2, 0, 40 * num_parts),
+        M_F=20 * num_parts,
+        M_B=-1 * num_parts,
+        M_W=-19 * num_parts,
+        M_Limit=20*num_parts*num_dev,
+        num_chunks=1,
+    )
+    pp = CPZBUDPipeline(sys_config, warm_start=False, use_cplex=True)
+    pp.schedule(logging=True, relative_gap=0.04, time_limit_sec=300)
+    pp.solve_dependencies()
+    # pp.print_debug_schedule(verbose=1)
+    pp.print_schedule(save=True, include_info=num_dev <= 8)
+    print(f'Runtime: {pp.get_schedule_time(device_wise=True) / num_parts}, Bubble: {pp.get_bubble_ratio(device_wise=True)}')
+
+
+def test_cp_wave_auto_solver():
+    num_dev = 8
+    num_parts = 1
+    sys_config = SystemConfig(
+        num_devices=num_dev,
+        num_microbatches=2*num_dev,
+        T_F=20 * num_parts,
+        T_B=25 * num_parts,
+        T_W=17 * num_parts,
+        T_C=generate_comm_mat(2, num_dev // 2, 0, 5 * num_parts),
+        T_beta=generate_comm_mat(2, num_dev // 2, 0, 40 * num_parts),
+        M_F=20 * num_parts,
+        M_B=-1 * num_parts,
+        M_W=-19 * num_parts,
+        M_Limit=20*num_parts*2*num_dev,
+        num_chunks=2,
+    )
+    pp = CPZBWavePipeline(sys_config, warm_start=False, use_cplex=True)
+    pp.schedule(logging=True, relative_gap=0.01, time_limit_sec=200)
+    pp.solve_dependencies()
+    # pp.print_debug_schedule(verbose=1)
+    pp.print_schedule(save=True, include_info=num_dev <= 8)
+    print(f'Runtime: {pp.get_schedule_time(device_wise=True) / num_parts}, Bubble: {pp.get_bubble_ratio(device_wise=True)}')
+
+
+def test_cp_loop_auto_solver():
+    num_dev = 4
+    num_parts = 1
+    num_dc = 2
+    num_dev_per_dc = num_dev // num_dc
+    sys_config = SystemConfig(
+        num_devices=num_dev,
+        num_microbatches=2*num_dev,
+        T_F=20 * num_parts,
+        T_B=25 * num_parts,
+        T_W=17 * num_parts,
+        T_C=generate_comm_mat(num_dc, num_dev_per_dc, 0, 0 * num_parts),
+        T_beta=generate_comm_mat(num_dc, num_dev_per_dc, 0, 40 * num_parts),
+        M_F=20 * num_parts,
+        M_B=-1 * num_parts,
+        M_W=-19 * num_parts,
+        M_Limit=20*num_parts*2*num_dev,
+        num_chunks=2,
+        two_dc=True
+    )
+    pp = CPZBLoopPipeline(sys_config, warm_start=False, use_cplex=True)
+    pp.schedule(logging=True, relative_gap=0.01, time_limit_sec=200)
+    pp.solve_dependencies()
+    # pp.print_debug_schedule(verbose=1)
+    pp.print_schedule(save=True, include_info=num_dev <= 8)
+    print(f'Runtime: {pp.get_schedule_time(device_wise=True) / num_parts}, Bubble: {pp.get_bubble_ratio(device_wise=True)}')
+
+
+def test_ud_auto():
+    num_dev = 16
+    num_parts = 1
+    sys_config = SystemConfig(
+        num_devices=num_dev,
+        num_microbatches=2*num_dev,
+        T_F=20 * num_parts,
+        T_B=25 * num_parts,
+        T_W=17 * num_parts,
+        T_C=generate_comm_mat(2, num_dev // 2, 0, 30 * num_parts),
+        T_beta=generate_comm_mat(2, num_dev // 2, 0, 0 * num_parts),
+        M_F=20 * num_parts,
+        M_B=-1 * num_parts,
+        M_W=-19 * num_parts,
+        M_Limit=20*num_parts*num_dev,
+        num_chunks=1,
+    )
+
+    azb = AutoZBUDPipeline(sys_config)
+    azb.schedule(verbose=True, time_limit=1200, warm_start=True)
+    azb.solve_dependencies()
+    azb.print_schedule(save=True, include_info=num_dev <= 8)
+
+
+def test_wave_auto():
+    num_dev = 16
+    sys_config = SystemConfig(
+        num_devices=num_dev,
+        num_microbatches=2*num_dev,
+        T_F=20,
+        T_B=25,
+        T_W=21,
+        T_C=generate_comm_mat(2, num_dev // 2, 0, 57),
+        M_F=1,
+        M_B=0,
+        M_W=-1,
+        M_Limit=2 * num_dev,
+        num_chunks=2,
+    )
+
+    azb = AutoWaveZBPipeline(sys_config)
+    azb.schedule(verbose=True, time_limit=1200, warm_start=True)
+    azb.solve_dependencies()
+    azb.print_schedule(save=True)
+
+def test_subpipe_ud():   
+    num_dev = 16
+    num_parts = 4
+    sys_config = SystemConfig(
+        num_devices=num_dev,
+        num_microbatches=2*num_dev,
+        T_F=20 * num_parts,
+        T_B=25 * num_parts,
+        T_W=17 * num_parts,
+        T_C=generate_comm_mat(2, num_dev // 2, 0, 30 * num_parts),
+        T_beta=generate_comm_mat(2, num_dev // 2, 0, 0 * num_parts),
+        M_F=20 * num_parts,
+        M_B=-1 * num_parts,
+        M_W=-19 * num_parts,
+        M_Limit=20*num_parts*num_dev,
+        num_chunks=1,
+    )
+    pp = DynZBUDSubPipeline(sys_config, num_subparts=num_parts)
+    pp.schedule()
+    # pp.print_debug_schedule(verbose=0)
+    pp.solve_dependencies()
+    print(f'Runtime: {pp.get_schedule_time(device_wise=True) / num_parts}, Bubble: {pp.get_bubble_ratio(device_wise=True)}')
+    pp.print_schedule(save=True, include_info=num_dev <= 8)
+    planner = ExecutionPlanner(pp)
+    planner.generate_execution_plan()
+    print(planner.print_execution_plan())
+    
+
+def test_subpipe_ud_recomp():   
+    num_dev = 16
+    num_parts = 4
+    sys_config = SystemConfig(
+        num_devices=num_dev,
+        num_microbatches=2*num_dev,
+        T_F=20 * num_parts,
+        T_B=45 * num_parts,
+        T_W=17 * num_parts,
+        T_C=generate_comm_mat(2, num_dev // 2, 0, 30 * num_parts),
+        T_beta=generate_comm_mat(2, num_dev // 2, 0, 0 * num_parts),
+        M_F=1 * num_parts,
+        M_B=18 * num_parts,
+        M_W=-19 * num_parts,
+        M_Limit=20*num_parts*num_dev,
+        num_chunks=1,
+    )
+    pp = DynZBUDSubPipeline(sys_config, num_subparts=num_parts)
+    pp.schedule()
+    # pp.print_debug_schedule(verbose=0)
+    pp.solve_dependencies()
+    print(f'Runtime: {pp.get_schedule_time(device_wise=True) / num_parts}, Bubble: {pp.get_bubble_ratio(device_wise=True)}')
+    pp.print_schedule(save=True, include_info=num_dev <= 8)
+    planner = ExecutionPlanner(pp)
+    planner.generate_execution_plan()
+
+
+def test_subpipe_wave():   
+    num_dev = 16
+    num_parts = 2
+    num_chunks = 2
+    sys_config = SystemConfig(
+        num_devices=num_dev,
+        num_microbatches=2*num_dev,
+        T_F=20 * num_parts,
+        T_B=25 * num_parts,
+        T_W=17 * num_parts,
+        T_C=generate_comm_mat(2, num_dev // 2, 0, 30 * num_parts),
+        T_beta=generate_comm_mat(2, num_dev // 2, 0, 0 * num_parts),
+        M_F=20 * num_parts,
+        M_B=-1 * num_parts,
+        M_W=-19 * num_parts,
+        M_Limit=20*num_chunks*num_parts*num_dev,
+        num_chunks=2,
+    )
+    example_pp = HeuristicZBVPipeline(sys_config)
+    example_pp.schedule()
+    example_pp.solve_dependencies()
+    # print(f'Baseline: Runtime: {example_pp.get_schedule_time(device_wise=True) / num_parts}')
+    example_pp.print_schedule(save=True)
+    pp = DynZBWaveSubPipeline(sys_config, num_subparts=num_parts)
+    pp.schedule()
+    # pp.print_debug_schedule(verbose=0)
+    pp.solve_dependencies()
+    print(f'Runtime: {pp.get_schedule_time(device_wise=True) / num_parts / num_chunks}, Bubble: {pp.get_bubble_ratio(device_wise=True)}')
+    pp.print_schedule(save=True, include_info=num_dev <= 8)
+    
+
 if __name__ == "__main__":
-    # test_basic_schedule()
-    # test_ud_zb()
-    # test_wave_zb()
-    # test_wave_zb(relax=False)
+    test_basic_schedule()
+    # test_wave_auto(relax=True)
     # test_schedule_store()
     # test_bfs_simulator()
     # test_simulator()
@@ -397,5 +557,14 @@ if __name__ == "__main__":
     
     # test_execution_planner_0()
     # test_execution_planner_1()
-    test_execution_planner_2()
+    # test_execution_planner_2()
+    
+    # test_cp_ud_auto_solver()
+    # test_cp_wave_auto_solver()
+    # test_cp_loop_auto_solver()
+    # test_ud_auto()
+    # test_wave_auto()
+    test_subpipe_ud()
+    test_subpipe_ud_recomp()
+    # test_subpipe_wave()
     

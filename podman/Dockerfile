@@ -1,0 +1,19 @@
+FROM nvcr.io/nvidia/pytorch:24.10-py3
+
+# to avoid interaction with apt-get
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --allow-downgrades --allow-change-held-packages --no-install-recommends \
+        build-essential \
+        automake \
+        autoconf \
+        libtool \
+        wget \
+        libpmi2-0-dev \
+        ca-certificates \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN pip install setuptools==69.5.1 datasets accelerate evaluate tokenizers sentencepiece transformers nltk deepspeed flash-attn nvtx \
+    tqdm protobuf tensorboard tiktoken wandb drawsvg gurobipy pulp scipy pyarrow regex docplex networkx pathlib sympy matplotlib pandas statsmodels
+
+# RUN git clone https://github.com/Dao-AILab/flash-attention.git && cd flash-attention/hopper && MAX_JOBS=4 python setup.py install

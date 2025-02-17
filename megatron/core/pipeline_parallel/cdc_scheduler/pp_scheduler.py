@@ -154,6 +154,9 @@ class CDCDynamicScheduleGenerator:
         self.M_B_list = profile_result["M_B"]
         self.M_W_list = profile_result["M_W"]
         self.M_Limit_list = profile_result["M_Limit"]
+        self.M_base_list = profile_result["M_base"]
+        self.device_max_mem = float(profile_result["M_dev_max"])
+        
 
         assert len(self.T_F_list) == self.pp_size
 
@@ -230,7 +233,7 @@ class CDCDynamicScheduleGenerator:
         for i in range(self.pp_size):
             unit_memory = max(self.M_F_list[i], self.M_F_list[i] + self.M_B_list[i])
             new_mem_limit = self.pp_size * self.num_chunks * (1 + extra_mem_factor) * unit_memory * 1.02
-            self.M_Limit_list[i] = new_mem_limit
+            self.M_Limit_list[i] = min(new_mem_limit, (self.device_max_mem - self.M_base_list[i]) * 0.96)
 
     def integerize_sys_cfg(self, sys_cfg: SystemConfig, multiply_factor: int = 1) -> SystemConfig:
         time_candidate = []
@@ -304,8 +307,8 @@ class CDCDynamicScheduleGenerator:
 
     def generate_schedule_from_profile(self) -> int:
         assert self.initialized
-        ud_solution_time = {4: 200, 8: 400, 16: 600}
-        wave_solution_time = {4: 200, 8: 400, 16: 600}
+        ud_solution_time = {4: 1200, 8: 1200, 16: 2400}
+        wave_solution_time = {4: 1500, 8: 1500, 16: 2400}
         estimated_runtime = 0
         if self.schedule_type == "wave":
             num_chunks = 2
@@ -1675,6 +1678,8 @@ class CDCPPScheduler:
                             "M_B": M_B_list,
                             "M_W": M_W_list,
                             "M_Limit": M_Limit_list,
+                            "M_base": base_mem_list,
+                            "M_dev_max": max_gpu_mem,
                         },
                         f,
                     )

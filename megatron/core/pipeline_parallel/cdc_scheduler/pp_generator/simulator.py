@@ -7,8 +7,8 @@ from pulp import LpVariable, LpProblem, LpMinimize, LpStatus, lpSum, value
 
 from .model_config import LLAMA_SIZE_TO_CONFIG, CUSTOM_SIZE_TO_CONFIG, LlamaConfig
 from .pipeline_config import SystemConfig
-from .pipeline import GpipePipeline, Hanayo1F1BPipeline, HeuristicWaveZBPipeline, Interleaved1F1BPipeline, OneFOneBPipeline, TaskNode, InterleavedTaskNode, ZBH1Pipeline
-from util import generate_comm_mat, scale_to_int
+from .pipeline import GpipePipeline, Hanayo1F1BPipeline, HeuristicWaveZBPipeline, Interleaved1F1BPipeline, OneFOneBPipeline, TaskNode, ZBH1Pipeline
+from .util import generate_comm_mat, scale_to_int
 from .auto_schedule import gurobi_options
 
 import pulp
@@ -333,7 +333,7 @@ class SimCfgGen:
         return 2 * (comm_group_size - 1) / comm_group_size * 2 * num_params / self.intra_DC_bandwidth 
     
     def get_total_runtime_with_DP_comm(self, scheduled_tasks: List[List[TaskNode]]):
-        is_chunked = isinstance(scheduled_tasks[0][0], InterleavedTaskNode)
+        is_chunked = isinstance(scheduled_tasks[0][0], TaskNode)
         is_wgrad_split = any([task.task_type == "W" for task in scheduled_tasks[0]])
         dev_total_time_list = [tasks[-1].completion_time - tasks[0].start_time for tasks in scheduled_tasks]
         dev_chunk_DP_start_time_list = [[] for _ in range(self.pp)]
