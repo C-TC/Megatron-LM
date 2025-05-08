@@ -14,6 +14,5 @@ RUN apt-get update && apt-get install -y --allow-downgrades --allow-change-held-
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 RUN pip install setuptools==69.5.1 datasets accelerate evaluate tokenizers sentencepiece transformers nltk deepspeed flash-attn nvtx \
-    tqdm protobuf tensorboard tiktoken wandb drawsvg gurobipy pulp scipy pyarrow regex docplex networkx pathlib sympy matplotlib pandas statsmodels
-
-# RUN git clone https://github.com/Dao-AILab/flash-attention.git && cd flash-attention/hopper && MAX_JOBS=4 python setup.py install
+    tqdm protobuf tensorboard tiktoken wandb drawsvg gurobipy pulp scipy pyarrow regex docplex networkx pathlib sympy matplotlib pandas statsmodels \
+    seaborn openpyxl

@@ -21,16 +21,14 @@ cdc_exp_per_cfg_test_iters = 64
 def get_job_str(job_title, num_nodes, TP, PP, num_layers, model_size, seq_len, mbs, gbs, layers_per_chunk, extra_cdc_args, lat_bw_as_F_stage_pairs):
     return f"""\
 #!/bin/bash -l
-#SBATCH --job-name="0:{job_title}"
+#SBATCH --job-name="7.1:{job_title}"
 #SBATCH --nodes={num_nodes}                   # number of nodes
 #SBATCH --ntasks-per-node=1        # Do not change
 #SBATCH --gpus-per-node=4          # number of gpus per node
 #SBATCH -c 288
 #SBATCH --mem=460000
-#SBATCH -A a-a06
 #SBATCH --exclusive
 #SBATCH --time=04:00:00            # total run time limit (HH:MM:SS)
-#SBATCH --exclude=nid[007603,007672]
 
 
 GLOBAL_ARGS="\
@@ -38,8 +36,10 @@ export CUDA_DEVICE_MAX_CONNECTIONS=0
 # export NCCL_DEBUG=INFO
 export NCCL_DEBUG=DEBUG
 export OMP_NUM_THREADS=1
-export TRITON_HOME=/capstor/scratch/cscs/ctianche/projects/crossdc/Megatron-LM/test_crossdc/.triton_cache
+export TRITON_HOME=${{SCRATCH}}/crosspipe_ae/Megatron-LM/test_crossdc/.triton_cache
+export TRITON_CACHE_DIR=${{SCRATCH}}/crosspipe_ae/Megatron-LM/test_crossdc/.triton_cache
 "
+mkdir -p ${{SCRATCH}}/crosspipe_ae/Megatron-LM/test_crossdc/.triton_cache
 
 # Distributed training variables
 NNODES=${{SLURM_NNODES}}
@@ -75,7 +75,7 @@ MAX_SEQ_LEN={seq_len}
 MAX_POSITION_EMBEDDINGS=${{MAX_SEQ_LEN}}
 
 # Paths
-BASE_PATH="/capstor/scratch/cscs/ctianche/projects/crossdc/Megatron-LM/test_crossdc/clariden/lat_bw_delay"
+BASE_PATH="${{SCRATCH}}/crosspipe_ae/Megatron-LM/test_crossdc/clariden/lat_bw_delay"
 SCRIPT_NAME=$(basename "$0")
 SCRIPT_BASENAME="${{SCRIPT_NAME%.*}}"
 
@@ -275,9 +275,9 @@ CDC_CMD="${{CMD}} ${{CDC_ARGS}}"
 srun --mpi=pmi2 --environment=megatron_cdc numactl --membind=0-3 bash -c "
 ${{GLOBAL_ARGS}}
 export NODE_RANK=\${{SLURM_NODEID}}
-export PATH=/users/ctianche/cplex_arm/cpoptimizer/bin/arm64_linux:\${{PATH}}
-export PYTHONPATH=/capstor/scratch/cscs/ctianche/projects/crossdc/pytorch:\${{PYTHONPATH}}
-export LD_LIBRARY_PATH=/capstor/scratch/cscs/ctianche/projects/crossdc/pytorch/build/lib:\${{LD_LIBRARY_PATH}}
+export PATH=${{SCRATCH}}/crosspipe_ae/cplex_arm/cpoptimizer/bin/arm64_linux:\${{PATH}}
+export PYTHONPATH=${{SCRATCH}}/crosspipe_ae/pytorch:\${{PYTHONPATH}}
+export LD_LIBRARY_PATH=${{SCRATCH}}/crosspipe_ae/pytorch/build/lib:${{SCRATCH}}/crosspipe_ae/acl/build:\${{LD_LIBRARY_PATH}}
 echo ${{CDC_CMD}}
 python -c 'import torch; print(f\\"torch version: {{torch.__version__}}\\"); print(f\\"torch path: {{torch.__path__}}\\")'
 ${{CDC_CMD}} 2>&1 | tee ${{LOG_PATH}}
