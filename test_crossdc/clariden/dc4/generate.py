@@ -39,6 +39,7 @@ export TRITON_HOME=${{SCRATCH}}/crosspipe_ae/Megatron-LM/test_crossdc/.triton_ca
 export TRITON_CACHE_DIR=${{SCRATCH}}/crosspipe_ae/Megatron-LM/test_crossdc/.triton_cache
 "
 mkdir -p ${{SCRATCH}}/crosspipe_ae/Megatron-LM/test_crossdc/.triton_cache
+ulimit -c 0
 
 # Distributed training variables
 NNODES=${{SLURM_NNODES}}
