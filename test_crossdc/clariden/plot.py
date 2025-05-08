@@ -313,6 +313,9 @@ def plot_pp_dp_tradeoff(df):
 
 exps = ['lat_bw_delay', 'extra_gbs_mem', 'dc4', 'pp_dp_tradeoff']
 # exps = ['extra_gbs_mem', 'dc4', 'pp_dp_tradeoff']
+# mkdir for figs and data
+os.makedirs(f"{current_dir}/../figs", exist_ok=True)
+os.makedirs(f"{current_dir}/../data", exist_ok=True)
 for exp in exps:
     print (f"==============Exploring {exp}==============")
     exp_dir = os.path.join(current_dir, '..', 'clariden', exp) # clariden or clariden_new (Jan 13th 2025)
