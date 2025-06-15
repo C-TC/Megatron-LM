@@ -1,3 +1,4 @@
+# adapted from https://github.com/sail-sg/zero-bubble-pipeline-parallelism
 import json
 
 import numpy as np

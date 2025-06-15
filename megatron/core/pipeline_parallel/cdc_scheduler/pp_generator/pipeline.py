@@ -4,12 +4,9 @@ import enum
 from typing import Callable, Dict, List, Tuple
 
 from .pipeline_config import PipelineBlockDesc, SystemConfig
-from .heuristic_schedule import ZBVHeuristicSchedule
-from .heuristic_schedule_v2 import ZBVHeuristicScheduleV2
 from .auto_cp_schedule import ZBLoopCPLEXScheduler, ZBUDCPLEXScheduler, ZBWaveCPLEXScheduler
 from .util import BandwidthDelayModel
 from .zbv_heuristic import OfficialZBVHeuristicScheduler
-from .heuristic_ud_schedule import UDHeuristicSchedule, ZBUDHeuristicSchedule
 from .svg_event import draw_events, TIME_PER_UNIT
 import os
 
@@ -73,18 +70,6 @@ class Pipeline:
         self.microbatch_scheduled_tasks: List[List[TaskNode]] = [
             [] for _ in range(self.sys_config.num_microbatches)
         ]
-
-    def _scalar_config_to_list(self):
-        for config in [
-            self.sys_config.T_F,
-            self.sys_config.T_B,
-            self.sys_config.T_W,
-            self.sys_config.M_F,
-            self.sys_config.M_B,
-            self.sys_config.M_W,
-        ]:
-            if not isinstance(config, list):
-                config = [config] * self.sys_config.num_devices
 
     def _get_tasknode_from_device(
         self,
@@ -176,15 +161,15 @@ class Pipeline:
         """
         raise NotImplementedError()
 
-    def _get_execution_time(self, dev: int, task_type: str) -> int:
+    def _get_execution_time(self, dev: int, task_type: str, chunk: int = 0) -> int:
         if task_type == "F":
-            return self.sys_config.T_F[dev]
+            return self.sys_config.T_F[chunk][dev]
         elif task_type == "B":
-            return self.sys_config.T_B[dev]
+            return self.sys_config.T_B[chunk][dev]
         else:
             # W block
-            assert self.sys_config.T_W[dev] > 0
-            return self.sys_config.T_W[dev]
+            assert self.sys_config.T_W[chunk][dev] > 0
+            return self.sys_config.T_W[chunk][dev]
 
     def solve_dependencies(self):
         bw_delay_model = BandwidthDelayModel(self.sys_config)
@@ -221,7 +206,7 @@ class Pipeline:
                         )
 
                     cur_dev_id = cur_task.device_id
-                    compute_time = self._get_execution_time(dev, cur_task.task_type)
+                    compute_time = self._get_execution_time(dev, cur_task.task_type, cur_task.chunk_id)
 
                     prev_microbatch_task_dev_id = (
                         prev_microbatch_task.device_id
@@ -232,7 +217,7 @@ class Pipeline:
                         comm_time = 0
                         bandwidth_time = 0
                     else:
-                        comm_time = self.sys_config.T_C[
+                        comm_time = self.sys_config.T_alpha[
                             prev_microbatch_task_dev_id, cur_dev_id
                         ]
                         bandwidth_time = self.sys_config.T_beta[
@@ -372,7 +357,8 @@ class Pipeline:
         num_chunks = self.sys_config.num_chunks
         cfg = self.sys_config
         total_effective_compute = [
-            num_mb * num_chunks * (cfg.T_F[i] + cfg.T_B[i] + cfg.T_W[i])
+            num_mb * (cfg.T_F[chunk][i] + cfg.T_B[chunk][i] + cfg.T_W[chunk][i])
+            for chunk in range(num_chunks)
             for i in range(num_dev)
         ]
         if device_wise:
@@ -398,11 +384,10 @@ class Pipeline:
         total_time = self.get_schedule_time()
         total_effective_compute = (
             num_mb
-            * num_chunks
             * (
-                sum(self.sys_config.T_F)
-                + sum(self.sys_config.T_B)
-                + sum(self.sys_config.T_W)
+                sum([self.sys_config.T_F[chunk][dev] for chunk in range(num_chunks) for dev in range(num_dev)])
+                + sum([self.sys_config.T_B[chunk][dev] for chunk in range(num_chunks) for dev in range(num_dev)])
+                + sum([self.sys_config.T_W[chunk][dev] for chunk in range(num_chunks) for dev in range(num_dev)])
             )
         )
         bubble_ratio = 1 - total_effective_compute / num_dev / total_time
@@ -528,7 +513,7 @@ class TwoChunkLoopPipelineTemplate(Pipeline):
                         )
 
                     cur_dev_id = cur_task.device_id
-                    compute_time = self._get_execution_time(dev, cur_task.task_type)
+                    compute_time = self._get_execution_time(dev, cur_task.task_type, cur_task.chunk_id)
 
                     prev_microbatch_task_dev_id = (
                         prev_microbatch_task.device_id
@@ -539,7 +524,7 @@ class TwoChunkLoopPipelineTemplate(Pipeline):
                         comm_time = 0
                         bandwidth_time = 0
                     else:
-                        comm_time = self.sys_config.T_C[
+                        comm_time = self.sys_config.T_alpha[
                             prev_microbatch_task_dev_id, cur_dev_id
                         ]
                         bandwidth_time = self.sys_config.T_beta[
@@ -935,257 +920,6 @@ class Interleaved1F1BPipeline(TwoChunkLoopPipelineTemplate):
         self._resolve_batch_dependency()
 
 
-# TODO: update this pipeline
-class Hanayo1F1BPipeline(Interleaved1F1BPipeline):
-    def __init__(self, sys_config: SystemConfig) -> None:
-        self.sys_config = sys_config
-        # self._scalar_config_to_list()
-
-        self.device_scheduled_tasks: List[List[TaskNode]] = [
-            [] for _ in range(self.sys_config.num_devices)
-        ]
-        self.microbatch_scheduled_tasks: List[List[TaskNode]] = [
-            [] for _ in range(self.sys_config.num_microbatches)
-        ]
-
-        assert sys_config.num_microbatches % sys_config.num_devices == 0
-        assert sys_config.num_chunks % 2 == 0
-
-    def pipeline_name(self):
-        return "Hanayo"
-
-    def get_pipeline_first_stage_rank(self):
-        return 0
-
-    def get_pipeline_last_stage_rank(self):
-        num_chunks = self.sys_config.num_chunks
-        return 0 if num_chunks % 2 == 0 else self.sys_config.num_devices - 1
-
-    def get_pipeline_execution_order(self) -> List[Tuple[int, int]]:
-        ret = []
-        for wave in range(self.sys_config.num_chunks // 2):
-            ret += [(dev, wave * 2) for dev in range(self.sys_config.num_devices)] + [
-                (dev, wave * 2 + 1)
-                for dev in reversed(range(self.sys_config.num_devices))
-            ]
-        return ret
-
-    def _get_microbatch_sequence(
-        self,
-    ) -> Tuple[
-        List[Tuple[int, str, int]], Callable[[TaskNode, int, Tuple], bool]
-    ]:
-        num_dev = self.sys_config.num_devices
-        num_chunks = self.sys_config.num_chunks
-        sequence = []
-
-        for wave in range(num_chunks // 2):
-            for dev in range(num_dev):
-                sequence.append((dev, "F", 2 * wave))
-            for dev in reversed(range(num_dev)):
-                sequence.append((dev, "F", 2 * wave + 1))
-
-        for wave in reversed(range(num_chunks // 2)):
-            for dev in range(num_dev):
-                sequence.append((dev, "B", 2 * wave + 1))
-            for dev in reversed(range(num_dev)):
-                sequence.append((dev, "B", 2 * wave))
-
-        def condition(task: TaskNode, mb: int, seq_ele: Tuple) -> bool:
-            return (
-                task.device_id == seq_ele[0]
-                and task.task_type == seq_ele[1]
-                and task.microbatch_id == mb
-                and task.chunk_id == seq_ele[2]
-            )
-
-        return sequence, condition
-
-    def is_send_to_next_rank(
-        self, prev_task: TaskNode, cur_task: TaskNode
-    ):
-        prev_dev = prev_task.device_id
-        cur_dev = cur_task.device_id
-        prev_type = prev_task.task_type
-        cur_type = cur_task.task_type
-        prev_chunk = prev_task.chunk_id
-        cur_chunk = cur_task.chunk_id
-        if prev_dev == cur_dev:
-            return 0
-        assert prev_type == cur_type
-        assert prev_chunk == cur_chunk
-        if prev_type == "F":
-            return 1 if prev_chunk % 2 == 0 else -1
-        elif prev_type == "B":
-            return 1 if prev_chunk % 2 == 1 else -1
-        else:
-            raise ValueError("Unreachable")
-
-    def schedule(self):
-        num_dev = self.sys_config.num_devices
-        num_mb = self.sys_config.num_microbatches
-        num_chunks = self.sys_config.num_chunks
-        sequence = self._get_microbatch_sequence()[0]
-        # print(sequence)
-
-        # a mini scheduler
-
-        class SchedUnitType(enum.Enum):
-            F = enum.auto()
-            B_0 = enum.auto()
-            B_1 = enum.auto()
-            X = enum.auto()  # Restricted Zone
-            U = enum.auto()  # Unallocated
-
-        @dataclass
-        class SchedUnit:
-            type: SchedUnitType = SchedUnitType.U
-            mb: int = -1
-            chunk: int = -1
-            index: int = -1
-
-        class HanayoScheduler:
-            def __init__(self) -> None:
-                self.dev_schedule: List[List[SchedUnit]] = [
-                    [SchedUnit() for _ in range(num_chunks * num_mb * 3 * 2)]
-                    for _ in range(num_dev)
-                ]
-
-            def _find_next_index(self, dev: int, task_type: str, cur_index: int) -> int:
-                for i in range(cur_index + 1, len(self.dev_schedule[dev])):
-                    if task_type == "F":
-                        if self.dev_schedule[dev][i].type == SchedUnitType.U:
-                            return i
-                    else:
-                        if (
-                            self.dev_schedule[dev][i].type == SchedUnitType.U
-                            and self.dev_schedule[dev][i + 1].type == SchedUnitType.U
-                        ):
-                            return i
-                raise ValueError(f"Cannot find next index for device {dev}")
-
-            def _get_schedunit_index(
-                self, dev: int, mb: int, chunk: int, type: SchedUnitType, start: int = 0
-            ) -> int:
-                for i, unit in enumerate(self.dev_schedule[dev][start:]):
-                    if unit.mb == mb and unit.chunk == chunk and unit.type == type:
-                        return i
-                raise ValueError(
-                    f"Cannot find schedunit for device {dev} {mb} {chunk} {type}"
-                )
-
-            def debug_print(self):
-                for dev in range(num_dev):
-                    print(f"Device {dev}: ", end="")
-                    for unit in self.dev_schedule[dev]:
-                        print(" | " + unit.type.name, end="")
-                    print(" |\n")
-
-            def schedule(self) -> None:
-                start_point_next_repeat = -1
-                for repeat in range(num_mb // num_dev):
-                    cur_index = start_point_next_repeat
-                    start_of_current_repeat = start_point_next_repeat
-                    mb_start = repeat * num_dev
-                    # schedule mb 0
-                    for dev, task_type, chunk in sequence:
-                        cur_index = self._find_next_index(dev, task_type, cur_index)
-                        if task_type == "F":
-                            self.dev_schedule[dev][cur_index] = SchedUnit(
-                                SchedUnitType.F, mb_start, chunk, cur_index
-                            )
-                        else:
-                            self.dev_schedule[dev][cur_index] = SchedUnit(
-                                SchedUnitType.B_0, mb_start, chunk, cur_index
-                            )
-                            self.dev_schedule[dev][cur_index + 1] = SchedUnit(
-                                SchedUnitType.B_1, mb_start, chunk, cur_index + 1
-                            )
-                            cur_index += 1
-                            if dev == 0 and chunk == 0:
-                                start_point_next_repeat = cur_index
-
-                    # set the restricted zone as in the paper
-                    for dev in range(num_dev):
-                        target_index = self._get_schedunit_index(
-                            dev, mb_start, 1, SchedUnitType.F
-                        )
-                        for i in range(1, num_dev - dev):
-                            if (
-                                self.dev_schedule[dev][target_index - i].type
-                                == SchedUnitType.U
-                            ):
-                                self.dev_schedule[dev][
-                                    target_index - i
-                                ].type = SchedUnitType.X
-
-                    for dev in range(num_dev):
-                        target_index = self._get_schedunit_index(
-                            dev, mb_start, num_chunks - 1, SchedUnitType.B_0
-                        )
-                        for i in range(1, dev + 1):
-                            if (
-                                self.dev_schedule[dev][target_index - i].type
-                                == SchedUnitType.U
-                            ):
-                                self.dev_schedule[dev][
-                                    target_index - i
-                                ].type = SchedUnitType.X
-
-                    # schedule mb 1 to num_dev - 1
-                    for mb in range(mb_start + 1, mb_start + num_dev):
-                        cur_index = start_of_current_repeat
-                        for dev, task_type, chunk in sequence:
-                            cur_index = self._find_next_index(dev, task_type, cur_index)
-                            if task_type == "F":
-                                self.dev_schedule[dev][cur_index] = SchedUnit(
-                                    SchedUnitType.F, mb, chunk, cur_index
-                                )
-                            else:
-                                self.dev_schedule[dev][cur_index] = SchedUnit(
-                                    SchedUnitType.B_0, mb, chunk, cur_index
-                                )
-                                self.dev_schedule[dev][cur_index + 1] = SchedUnit(
-                                    SchedUnitType.B_1, mb, chunk, cur_index + 1
-                                )
-                                cur_index += 1
-
-            def generate_task_nodes(
-                self, device_scheduled_tasks: List[List[TaskNode]]
-            ):
-                for dev in range(num_dev):
-                    for unit in self.dev_schedule[dev]:
-                        if unit.type == SchedUnitType.F:
-                            device_scheduled_tasks[dev].append(
-                                TaskNode(
-                                    task_type="F",
-                                    device_id=dev,
-                                    microbatch_id=unit.mb,
-                                    chunk_id=unit.chunk,
-                                    prev_device_task=device_scheduled_tasks[dev][-1]
-                                    if len(device_scheduled_tasks[dev]) > 0
-                                    else None,
-                                    prev_microbatch_task=None,
-                                )
-                            )
-                        elif unit.type == SchedUnitType.B_0:
-                            device_scheduled_tasks[dev].append(
-                                TaskNode(
-                                    task_type="B",
-                                    device_id=dev,
-                                    microbatch_id=unit.mb,
-                                    chunk_id=unit.chunk,
-                                    prev_device_task=device_scheduled_tasks[dev][-1],
-                                    prev_microbatch_task=None,
-                                )
-                            )
-
-        scheduler = HanayoScheduler()
-        scheduler.schedule()
-        scheduler.generate_task_nodes(self.device_scheduled_tasks)
-        self._resolve_batch_dependency()
-
-
 class ZBH1Pipeline(OneChunkPipelineTemplate):
     def __init__(self, sys_config: SystemConfig) -> None:
         super().__init__(sys_config)
@@ -1322,7 +1056,6 @@ class AutoZBUDPipeline(OneChunkPipelineTemplate):
                     )
                 )
 
-        # self.print_debug_schedule(verbose=0)
         self._resolve_batch_dependency()
     
     def get_schedule(self) -> List[List[PipelineBlockDesc]]:
@@ -1369,107 +1102,6 @@ class AutoWaveZBPipeline(TwoChunkWavePipelineTemplate):
     
     def get_schedule(self) -> List[List[PipelineBlockDesc]]:
         return self.dg.get_schedule()
-
-
-class HeuristicWaveZBPipeline(TwoChunkWavePipelineTemplate):
-    def __init__(self, sys_config: SystemConfig) -> None:
-        super().__init__(sys_config)
-        
-        self.scheduler = ZBVHeuristicSchedule(self.sys_config)
-
-    def pipeline_name(self):
-        return "HeuristicWaveZB"
-
-    def schedule(self):
-        self.scheduler.schedule()
-        schedule = self.scheduler.get_schedule()
-
-        num_dev = self.sys_config.num_devices
-
-        for dev in range(num_dev):
-            for i, block in enumerate(schedule[dev]):
-                self.device_scheduled_tasks[dev].append(
-                    TaskNode(
-                        task_type=block.task_type,
-                        device_id=block.device_id,
-                        microbatch_id=block.mb_id,
-                        chunk_id=block.chunk_id,
-                        prev_device_task=self.device_scheduled_tasks[dev][-1] if i > 0 else None,
-                        prev_microbatch_task=None,
-                    )
-                )
-
-        self._resolve_batch_dependency()
-
-
-class HeuristicUDPipeline(OneChunkPipelineTemplate):
-    def __init__(self, sys_config: SystemConfig) -> None:
-        super().__init__(sys_config)
-        
-        self.scheduler = UDHeuristicSchedule(self.sys_config)
-
-    def pipeline_name(self):
-        return "HeuristicUD"
-
-    def schedule(self):
-        self.scheduler.schedule()
-        schedule = self.scheduler.get_schedule()
-
-        num_dev = self.sys_config.num_devices
-
-        for dev in range(num_dev):
-            for i, block in enumerate(schedule[dev]):
-                self.device_scheduled_tasks[dev].append(
-                    TaskNode(
-                        task_type=block.task_type,
-                        device_id=block.device_id,
-                        microbatch_id=block.mb_id,
-                        prev_device_task=self.device_scheduled_tasks[dev][-1] if i > 0 else None,
-                        prev_microbatch_task=None,
-                    )
-                )
-
-        self._resolve_batch_dependency()
-
-
-class HeuristicZBUDPipeline(OneChunkPipelineTemplate):
-    def __init__(self, sys_config: SystemConfig) -> None:
-        super().__init__(sys_config)
-        self.scheduler = ZBUDHeuristicSchedule(self.sys_config)
-
-    def pipeline_name(self):
-        return "HeuristicZBUD"
-
-    def schedule(self):
-        self.scheduler.schedule()
-        schedule = self.scheduler.get_schedule()
-
-        num_dev = self.sys_config.num_devices
-
-        for dev in range(num_dev):
-            for i, block in enumerate(schedule[dev]):
-                self.device_scheduled_tasks[dev].append(
-                    TaskNode(
-                        task_type=block.task_type,
-                        device_id=block.device_id,
-                        microbatch_id=block.mb_id,
-                        prev_device_task=self.device_scheduled_tasks[dev][-1] if i > 0 else None,
-                        prev_microbatch_task=None,
-                    )
-                )
-
-        self._resolve_batch_dependency()
-        return schedule
-
-class HeuristicWaveZBPipelineV2(HeuristicWaveZBPipeline):
-    def pipeline_name(self):
-        return "HeuristicWaveZB(V2)"
-
-    def __init__(self, sys_config: SystemConfig) -> None:
-        super().__init__(sys_config)
-        
-        assert all([x > 0 for x in self.sys_config.T_W])
-        self.scheduler = ZBVHeuristicScheduleV2(self.sys_config)
 
 
 class HeuristicZBVPipeline(TwoChunkWavePipelineTemplate):
@@ -1650,7 +1282,7 @@ class OfficialZBVPipeline(TwoChunkWavePipelineTemplate):
             T_F=10,
             T_B=10,
             T_W=10,
-            T_C=0,
+            T_alpha=0,
             num_chunks=2,
             M_F=2,
             M_B=-1,
@@ -1693,7 +1325,7 @@ def get_default_static_schedule(
         T_F=20,
         T_B=40,
         T_W=0,
-        T_C=0,
+        T_alpha=0,
     )
     iv_1f1b_cfg = SystemConfig(
         num_devices=num_devices,
@@ -1701,7 +1333,7 @@ def get_default_static_schedule(
         T_F=10,
         T_B=20,
         T_W=0,
-        T_C=0,
+        T_alpha=0,
         num_chunks=2,
         two_dc=False,
     )
@@ -1711,7 +1343,7 @@ def get_default_static_schedule(
         T_F=10,
         T_B=10,
         T_W=10,
-        T_C=0,
+        T_alpha=0,
     )
     zbv_cfg = SystemConfig(
         num_devices=num_devices,
@@ -1719,7 +1351,7 @@ def get_default_static_schedule(
         T_F=10,
         T_B=10,
         T_W=10,
-        T_C=0,
+        T_alpha=0,
         num_chunks=2,
         M_F=2,
         M_B=-1,
@@ -1732,8 +1364,6 @@ def get_default_static_schedule(
         pipeline = GpipePipeline(default_cfg)
     elif pipeline_name == "Interleaved1F1B":
         pipeline = Interleaved1F1BPipeline(iv_1f1b_cfg)
-    elif pipeline_name == "Hanayo":
-        pipeline = Hanayo1F1BPipeline(iv_1f1b_cfg)
     elif pipeline_name == "ZBH1":
         pipeline = ZBH1Pipeline(zbh1_cfg)
     elif pipeline_name == "ZBV":

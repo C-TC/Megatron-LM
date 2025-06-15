@@ -1,16 +1,18 @@
+# adapted from https://github.com/sail-sg/zero-bubble-pipeline-parallelism
+
 import numpy as np
 import psutil
 from typing import Dict, List, Optional, Tuple
-from .pipeline_config import SystemConfig
+from .pipeline_config import PipelineBlockDesc, SystemConfig
 from pulp import LpVariable, LpProblem, LpMinimize, LpStatus, lpSum, value
 import pulp
 import gurobipy as gp
 import scipy.sparse as sp
 
 gurobi_options = {
-    "WLSACCESSID": "813ae627-c773-452d-8bd5-2cbe1225118c",
-    "WLSSECRET": "77e9fd95-2d5a-479f-977a-1c3cc2b28567",
-    "LICENSEID": 2531862,
+    "WLSACCESSID": "<your_access_id>",
+    "WLSSECRET": "<your_secret>",
+    "LICENSEID": "<your_license_id>",
     "THREADS": psutil.cpu_count(logical=False),
 }
 
@@ -28,18 +30,18 @@ class DependencyGraph:
         self.prob: Optional[LpProblem] = None
         self.prob_F: Optional[Dict[int, LpVariable]] = None
 
-        assert all([type(Tf) is int for Tf in self.system_cfg.T_F])
-        assert all([type(Tb) is int for Tb in self.system_cfg.T_B])
-        assert all([type(Tw) is int for Tw in self.system_cfg.T_W])
-        # assert isinstance(self.system_cfg.T_C, np.ndarray) and np.issubdtype(self.system_cfg.T_C.dtype, np.integer)
-        assert all(
-            [
-                f + b + w == 0
-                for f, b, w in zip(
-                    self.system_cfg.M_F, self.system_cfg.M_B, self.system_cfg.M_W
-                )
-            ]
-        )
+        for chunk in range(self.num_chunk):
+            assert all([type(Tf) is int for Tf in self.system_cfg.T_F[chunk]])
+            assert all([type(Tb) is int for Tb in self.system_cfg.T_B[chunk]])
+            assert all([type(Tw) is int for Tw in self.system_cfg.T_W[chunk]])
+            assert all(
+                [
+                    f + b + w == 0
+                    for f, b, w in zip(
+                        self.system_cfg.M_F[chunk], self.system_cfg.M_B[chunk], self.system_cfg.M_W[chunk]
+                    )
+                ]
+            )
 
     # ID: [dev][mb][task_type]
     def _get_id(self, dev: int, mb: int, task_type: int) -> int:
@@ -98,23 +100,14 @@ class DependencyGraph:
     def build_ilp(self) -> None:
         raise NotImplementedError
 
-    def solve_ilp(self, verbose=True, warm_start=False, time_limit=200) -> None:
-        # assert "PULP_CBC_CMD" in pulp.listSolvers(onlyAvailable=True)
-        # solver = pulp.PULP_CBC_CMD(
-        #     mip=True,
-        #     msg=verbose,
-        #     warmStart=warm_start,
-        #     gapRel=1e-8,
-        #     threads=mp.cpu_count() // 2,
-        #     timeLimit=time_limit,
-        # )
+    def solve_ilp(self, verbose=True, warm_start=False, time_limit=200, relative_gap=0.01) -> None:
         try:
             with gp.Env(params=gurobi_options) as env:
                 solver = pulp.GUROBI(
                     mip=True,
                     msg=verbose,
                     warmStart=warm_start,
-                    gapRel=1e-8,
+                    gapRel=relative_gap,
                     timeLimit=time_limit,
                     env=env,
                 )
@@ -126,7 +119,7 @@ class DependencyGraph:
             if solver is not None:
                 solver.close()
 
-    def get_schedule(self) -> List[List[Tuple[int, int, str, int]]]:
+    def get_schedule(self) -> List[List[PipelineBlockDesc]]:
         raise NotImplementedError
 
     def get_lp_status(self) -> int:
@@ -171,15 +164,15 @@ class UnidirectionalZBDependencyGraph(DependencyGraph):
         ][task_type]
 
     def _get_comm_cost(self, src_dev_id, dst_dev_id) -> int:
-        return self.system_cfg.T_C[src_dev_id][dst_dev_id]
+        return self.system_cfg.T_alpha[src_dev_id][dst_dev_id]
 
     def _get_mem_cost(self, id: int) -> int:
         task_type = self._get_task_type(id)
         dev = self._get_dev(id)
         return [
-            self.system_cfg.M_F[dev],
-            self.system_cfg.M_B[dev],
-            self.system_cfg.M_W[dev],
+            self.system_cfg.M_F[0][dev],
+            self.system_cfg.M_B[0][dev],
+            self.system_cfg.M_W[0][dev],
         ][task_type]
 
     def _init_direct_inherent_dependency(self) -> None:
@@ -244,10 +237,10 @@ class UnidirectionalZBDependencyGraph(DependencyGraph):
 
         inf = (
             (
-                max(self.system_cfg.T_F)
-                + max(self.system_cfg.T_B)
-                + max(self.system_cfg.T_W)
-                + np.max(self.system_cfg.T_C) * 3
+                max(self.system_cfg.T_F[0])
+                + max(self.system_cfg.T_B[0])
+                + max(self.system_cfg.T_W[0])
+                + np.max(self.system_cfg.T_alpha) * 3
             )
             * self.num_dev
             * self.num_mb
@@ -326,7 +319,7 @@ class UnidirectionalZBDependencyGraph(DependencyGraph):
         self.prob = prob
         self.prob_F = F
 
-    def get_schedule(self) -> List[List[Tuple[int, int, str, int]]]:
+    def get_schedule(self) -> List[List[PipelineBlockDesc]]:
         assert self.prob is not None
         assert self.prob_F is not None
 
@@ -339,17 +332,17 @@ class UnidirectionalZBDependencyGraph(DependencyGraph):
                     for task_type in range(3):
                         task_id = self._get_id(dev, mb, task_type)
                         schedule[dev].append(
-                            (
-                                dev,
-                                mb,
-                                type_id_to_task[task_type],
-                                int(value(self.prob_F[task_id])),
+                            PipelineBlockDesc(
+                                device_id=dev,
+                                mb_id=mb,
+                                task_type=type_id_to_task[task_type],
+                                end_time=int(value(self.prob_F[task_id])),
                             )
                         )
 
             # sort by completion time
             for dev in range(self.num_dev):
-                schedule[dev].sort(key=lambda x: x[3])
+                schedule[dev].sort(key=lambda x: x.end_time)
         except Exception as e:
             return None
 
@@ -389,22 +382,24 @@ class WaveLikeZBDependencyGraph(DependencyGraph):
     def _get_task_time_cost(self, id: int) -> int:
         task_type = self._get_task_type(id)
         dev = self._get_dev(id)
+        chunk = self._get_chunk(id)
         return [
-            self.system_cfg.T_F[dev],
-            self.system_cfg.T_B[dev],
-            self.system_cfg.T_W[dev],
+            self.system_cfg.T_F[chunk][dev],
+            self.system_cfg.T_B[chunk][dev],
+            self.system_cfg.T_W[chunk][dev],
         ][task_type]
 
     def _get_comm_cost(self, src_dev_id, dst_dev_id) -> int:
-        return self.system_cfg.T_C[src_dev_id][dst_dev_id]
+        return self.system_cfg.T_alpha[src_dev_id][dst_dev_id]
 
     def _get_mem_cost(self, id: int) -> int:
         task_type = self._get_task_type(id)
         dev = self._get_dev(id)
+        chunk = self._get_chunk(id)
         return [
-            self.system_cfg.M_F[dev],
-            self.system_cfg.M_B[dev],
-            self.system_cfg.M_W[dev],
+            self.system_cfg.M_F[chunk][dev],
+            self.system_cfg.M_B[chunk][dev],
+            self.system_cfg.M_W[chunk][dev],
         ][task_type]
 
     def _init_direct_inherent_dependency(self) -> None:
@@ -491,7 +486,7 @@ class WaveLikeZBDependencyGraph(DependencyGraph):
                 max(self.system_cfg.T_F)
                 + max(self.system_cfg.T_B)
                 + max(self.system_cfg.T_W)
-                + np.max(self.system_cfg.T_C) * 3
+                + np.max(self.system_cfg.T_alpha) * 3
             )
             * self.num_dev
             * self.num_mb
@@ -571,7 +566,7 @@ class WaveLikeZBDependencyGraph(DependencyGraph):
         self.prob = prob
         self.prob_F = F
 
-    def get_schedule(self) -> List[List[Tuple[int, int, str, int]]]:
+    def get_schedule(self) -> List[List[PipelineBlockDesc]]:
         assert self.prob is not None
         assert self.prob_F is not None
 
@@ -584,18 +579,18 @@ class WaveLikeZBDependencyGraph(DependencyGraph):
                         for task_type in range(3):
                             task_id = self._get_id(dev, mb, chunk, task_type)
                             schedule[dev].append(
-                                (
-                                    dev,
-                                    mb,
-                                    chunk,
-                                    type_id_to_task[task_type],
-                                    int(value(self.prob_F[task_id])),
+                                PipelineBlockDesc(
+                                    device_id=dev,
+                                    mb_id=mb,
+                                    task_type=type_id_to_task[task_type],
+                                    chunk_id=chunk,
+                                    end_time=int(value(self.prob_F[task_id])),
                                 )
                             )
 
             # sort by completion time
             for dev in range(self.num_dev):
-                schedule[dev].sort(key=lambda x: x[4])
+                schedule[dev].sort(key=lambda x: x.end_time)
 
         except Exception as e:
             return None

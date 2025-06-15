@@ -433,19 +433,17 @@ class PipelineGraph(object):
 class OfficialZBVHeuristicScheduler:
     def __init__(self, sys_cfg: SystemConfig):
         self.sys_cfg = sys_cfg
-        memory_pressure = [sys_cfg.M_Limit[x] / sys_cfg.M_F[x] for x in range(sys_cfg.num_devices)]
-        bottleneck = np.argmax(memory_pressure)
         self.graph = PipelineGraph(
             n_stage=sys_cfg.num_devices,
             n_micro=sys_cfg.num_microbatches,
-            f_cost=sys_cfg.T_F[bottleneck],
-            b_cost=sys_cfg.T_B[bottleneck],
-            w_cost=sys_cfg.T_W[bottleneck],
-            c_cost=np.min(sys_cfg.T_C),
-            f_mem=sys_cfg.M_F[bottleneck],
-            b_mem=sys_cfg.M_B[bottleneck],
-            w_mem=sys_cfg.M_W[bottleneck],
-            max_mem=sys_cfg.M_Limit[bottleneck],
+            f_cost=np.mean(sys_cfg.T_F),
+            b_cost=np.mean(sys_cfg.T_B),
+            w_cost=np.mean(sys_cfg.T_W),
+            c_cost=np.mean(sys_cfg.T_alpha),
+            f_mem=np.mean(sys_cfg.M_F),
+            b_mem=np.mean(sys_cfg.M_B),
+            w_mem=np.mean(sys_cfg.M_W),
+            max_mem=np.mean(sys_cfg.M_Limit),
         )
         self.schedule = None
     

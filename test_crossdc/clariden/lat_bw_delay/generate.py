@@ -36,10 +36,10 @@ export CUDA_DEVICE_MAX_CONNECTIONS=0
 # export NCCL_DEBUG=INFO
 export NCCL_DEBUG=DEBUG
 export OMP_NUM_THREADS=1
-export TRITON_HOME=${{SCRATCH}}/crosspipe_ae/Megatron-LM/test_crossdc/.triton_cache
-export TRITON_CACHE_DIR=${{SCRATCH}}/crosspipe_ae/Megatron-LM/test_crossdc/.triton_cache
+export TRITON_HOME=${{SCRATCH}}/amendment/Megatron-LM/test_crossdc/.triton_cache
+export TRITON_CACHE_DIR=${{SCRATCH}}/amendment/Megatron-LM/test_crossdc/.triton_cache
 "
-mkdir -p ${{SCRATCH}}/crosspipe_ae/Megatron-LM/test_crossdc/.triton_cache
+mkdir -p ${{SCRATCH}}/amendment/Megatron-LM/test_crossdc/.triton_cache
 ulimit -c 0
 
 # Distributed training variables
@@ -76,7 +76,7 @@ MAX_SEQ_LEN={seq_len}
 MAX_POSITION_EMBEDDINGS=${{MAX_SEQ_LEN}}
 
 # Paths
-BASE_PATH="${{SCRATCH}}/crosspipe_ae/Megatron-LM/test_crossdc/clariden/lat_bw_delay"
+BASE_PATH="${{SCRATCH}}/amendment/Megatron-LM/test_crossdc/clariden/lat_bw_delay"
 SCRIPT_NAME=$(basename "$0")
 SCRIPT_BASENAME="${{SCRIPT_NAME%.*}}"
 
@@ -165,6 +165,10 @@ TRAINING_ARGS=" \\
     --no-barrier-with-level-1-timing \\
     --no-align-grad-reduce \\
     --no-align-param-gather \\
+    --overlap-grad-reduce \\
+    --overlap-param-gather \\
+    --ddp-bucket-size 100000000000 \\
+    --ckpt-format torch \\
     --no-check-for-nan-in-loss-and-grad \\
     --distributed-timeout-minutes 10 \\
     "
@@ -276,9 +280,9 @@ CDC_CMD="${{CMD}} ${{CDC_ARGS}}"
 srun --mpi=pmi2 --environment=megatron_cdc numactl --membind=0-3 bash -c "
 ${{GLOBAL_ARGS}}
 export NODE_RANK=\${{SLURM_NODEID}}
-export PATH=${{SCRATCH}}/crosspipe_ae/cplex_arm/cpoptimizer/bin/arm64_linux:\${{PATH}}
-export PYTHONPATH=${{SCRATCH}}/crosspipe_ae/pytorch:\${{PYTHONPATH}}
-export LD_LIBRARY_PATH=${{SCRATCH}}/crosspipe_ae/pytorch/build/lib:${{SCRATCH}}/crosspipe_ae/acl/build:\${{LD_LIBRARY_PATH}}
+export PATH=${{SCRATCH}}/amendment/cplex_arm/cpoptimizer/bin/arm64_linux:\${{PATH}}
+export PYTHONPATH=${{SCRATCH}}/amendment/pytorch:\${{PYTHONPATH}}
+export LD_LIBRARY_PATH=${{SCRATCH}}/amendment/pytorch/build/lib:${{SCRATCH}}/amendment/acl/build:\${{LD_LIBRARY_PATH}}
 echo ${{CDC_CMD}}
 python -c 'import torch; print(f\\"torch version: {{torch.__version__}}\\"); print(f\\"torch path: {{torch.__path__}}\\")'
 ${{CDC_CMD}} 2>&1 | tee ${{LOG_PATH}}
@@ -291,7 +295,7 @@ ${{CDC_CMD}} 2>&1 | tee ${{LOG_PATH}}
 
 job_dict = {}
 
-for TP, PP, DP, num_layers, model_size in [(2, 4, 1, 32, 7), (4, 8, 1, 64, 70)]:
+for TP, PP, DP, num_layers, model_size in [(2, 4, 2, 32, 7), (4, 8, 2, 64, 70)]:
     num_nodes = TP * PP * DP // 4
     gbs = mbs * DP * PP * 2
     pp_stages_per_dc = PP // num_dc

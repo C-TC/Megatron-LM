@@ -10,18 +10,17 @@ class ZBUDCPLEXScheduler:
         self.sys_cfg = sys_cfg
         self.num_dev = sys_cfg.num_devices
         assert sys_cfg.num_chunks == 1
+        self.num_chunks = sys_cfg.num_chunks
         self.num_mb = sys_cfg.num_microbatches
+        self.zero_1_dp_modeling = sys_cfg.zero_1_dp_modeling
         self.solved = False
         self.cp_context = cp_context
-        # self.cp_context.solver.local.execfile = (
-        #     "/capstor/scratch/cscs/ctianche/projects/crossdc/Megatron-LM/megatron/core/pipeline_parallel/cdc_scheduler/pp_generator/run_cpoptimizer.sh"
-        # )
         self.solution: Optional[cp_model_cplex.CpoSolveResult] = None
 
         # Compute horizon (max time)
         comm_round_trip = sum(
             [
-                sys_cfg.T_C[i][i + 1] + sys_cfg.T_C[i + 1][i]
+                sys_cfg.T_alpha[i][i + 1] + sys_cfg.T_alpha[i + 1][i]
                 for i in range(self.num_dev - 1)
             ]
         ) + sum(
@@ -32,23 +31,33 @@ class ZBUDCPLEXScheduler:
         )
         compute_round_trip = sum(
             [
-                sys_cfg.T_F[i] + sys_cfg.T_B[i] + sys_cfg.T_W[i]
+                sys_cfg.T_F[0][i] + sys_cfg.T_B[0][i] + sys_cfg.T_W[0][i]
                 for i in range(self.num_dev)
             ]
         )
-        self.horizon = int((comm_round_trip + compute_round_trip) * self.num_mb)
-        # print(f"Horizon: {self.horizon}")
+        dp_comm = sum(
+            [
+                sys_cfg.T_DP[0][i][0] + sys_cfg.T_DP[0][i][1]
+                for i in range(self.num_dev)
+            ]
+        ) if self.zero_1_dp_modeling else 0
+        
+        self.horizon = int((comm_round_trip + compute_round_trip + dp_comm) * self.num_mb)
 
         # Create the model
         self.model = cp_model_cplex.CpoModel()
 
-        # Create variables (similar structure but using docplex syntax)
+        # Create variables (mb, task_type, dev) -> interval
         self.task_interval: Dict[
             Tuple[int, int, int], cp_model_cplex.CpoIntervalVar
         ] = {}
         self.memory_usage = [[] for _ in range(self.num_dev)]
         # (mb, src, dst) -> interval
         self.communication_intervals: Dict[
+            Tuple[int, int, int], cp_model_cplex.CpoIntervalVar
+        ] = {}
+        # (dev, chunk, 2) -> interval
+        self.dp_comm_interval: Dict[
             Tuple[int, int, int], cp_model_cplex.CpoIntervalVar
         ] = {}
         
@@ -59,7 +68,7 @@ class ZBUDCPLEXScheduler:
             dev_memory_usage = []
             for mb in range(self.num_mb):
                 for task_type in range(3):
-                    t_interval = [sys_cfg.T_F[dev], sys_cfg.T_B[dev], sys_cfg.T_W[dev]][
+                    t_interval = [sys_cfg.T_F[0][dev], sys_cfg.T_B[0][dev], sys_cfg.T_W[0][dev]][
                         task_type
                     ]
                     interval_var = cp_model_cplex.interval_var(
@@ -70,7 +79,7 @@ class ZBUDCPLEXScheduler:
                     self.task_interval[(mb, task_type, dev)] = interval_var
 
                     memory_increase = int(
-                        [sys_cfg.M_F[dev], sys_cfg.M_B[dev], sys_cfg.M_W[dev]][
+                        [sys_cfg.M_F[0][dev], sys_cfg.M_B[0][dev], sys_cfg.M_W[0][dev]][
                             task_type
                         ]
                     )
@@ -125,6 +134,31 @@ class ZBUDCPLEXScheduler:
                     ]
                 )
             )
+        
+        if self.zero_1_dp_modeling:
+            for chunk in range(self.num_chunks):
+                for dev in range(self.num_dev):
+                    interval_var = cp_model_cplex.interval_var(
+                        size=int(sys_cfg.T_DP[chunk][dev][0]),
+                        name=f"dp_ag_interval_{dev}_{chunk}",
+                        start=(0, self.horizon),
+                    )
+                    self.dp_comm_interval[(dev, chunk, 0)] = interval_var
+                    interval_var = cp_model_cplex.interval_var(
+                        size=int(sys_cfg.T_DP[chunk][dev][1]),
+                        name=f"dp_rs_interval_{dev}_{chunk}",
+                        start=(0, self.horizon),
+                    )
+                    self.dp_comm_interval[(dev, chunk, 1)] = interval_var
+            
+            for dev in range(self.num_dev):
+                cp_model_cplex.no_overlap(
+                    [
+                        self.dp_comm_interval[(dev, chunk, i)]
+                        for chunk in range(self.num_chunks)
+                        for i in range(2)
+                    ]
+                )
 
         # No overlap constraints
         for dev in range(self.num_dev):
@@ -155,6 +189,22 @@ class ZBUDCPLEXScheduler:
                     )
                 )
 
+        # DP comm constraints
+        if self.zero_1_dp_modeling:
+            for dev in range(self.num_dev):
+                self.model.add(
+                    cp_model_cplex.end_before_start(
+                        self.dp_comm_interval[(dev, 0, 0)],
+                        self.task_interval[(0, 0, dev)],
+                    )
+                )
+                self.model.add(
+                    cp_model_cplex.end_before_start(
+                        self.task_interval[(self.num_mb - 1, 2, dev)],
+                        self.dp_comm_interval[(dev, 0, 1)],
+                    )
+                )
+        
         # Microbatch ordering constraints
         for mb in range(1, self.num_mb):
             for dev in range(self.num_dev):
@@ -170,7 +220,7 @@ class ZBUDCPLEXScheduler:
         for mb in range(self.num_mb):
             for dev in range(self.num_dev - 1):
                 # Forward pass
-                forward_delay = int(sys_cfg.T_C[dev][dev + 1])
+                forward_delay = int(sys_cfg.T_alpha[dev][dev + 1])
                 if self.sys_cfg.T_beta[dev][dev + 1] == 0:
                     self.model.add(
                         cp_model_cplex.end_before_start(
@@ -195,7 +245,7 @@ class ZBUDCPLEXScheduler:
                         )
                     )
                 # Backward pass
-                backward_delay = int(sys_cfg.T_C[dev + 1][dev])
+                backward_delay = int(sys_cfg.T_alpha[dev + 1][dev])
                 if self.sys_cfg.T_beta[dev + 1][dev] == 0:
                     self.model.add(
                         cp_model_cplex.end_before_start(
@@ -220,30 +270,42 @@ class ZBUDCPLEXScheduler:
                         )
                     )
 
-        # First task starts at time 0
-        self.model.add(cp_model_cplex.start_of(self.task_interval[(0, 0, 0)]) == 0)
+        if self.zero_1_dp_modeling:
+            self.model.add(cp_model_cplex.start_of(self.dp_comm_interval[(0, 0, 0)]) == 0)
+        else:
+            # First task starts at time 0
+            self.model.add(cp_model_cplex.start_of(self.task_interval[(0, 0, 0)]) == 0)
 
         # Objective variables
         self.dev_span = cp_model_cplex.integer_var(0, self.horizon, name="dev_span")
         self.bubble = cp_model_cplex.integer_var(0, self.horizon, name="bubble")
 
-        # Maximum completion time across all devices
-        self.model.add(
-            cp_model_cplex.max(
+        if self.zero_1_dp_modeling:
+            self.model.add(cp_model_cplex.max(
                 [
-                    cp_model_cplex.end_of(self.task_interval[(self.num_mb - 1, 2, dev)])
-                    - cp_model_cplex.start_of(self.task_interval[(0, 0, dev)])
+                    cp_model_cplex.end_of(self.dp_comm_interval[(dev, 0, 1)])
+                    - cp_model_cplex.start_of(self.dp_comm_interval[(dev, 0, 0)])
                     for dev in range(self.num_dev)
                 ]
+            ) == self.dev_span)
+        else:
+            # Maximum completion time across all devices
+            self.model.add(
+                cp_model_cplex.max(
+                    [
+                        cp_model_cplex.end_of(self.task_interval[(self.num_mb - 1, 2, dev)])
+                        - cp_model_cplex.start_of(self.task_interval[(0, 0, dev)])
+                        for dev in range(self.num_dev)
+                    ]
+                )
+                == self.dev_span
             )
-            == self.dev_span
-        )
 
         # Bubble time calculation
         bubble_terms = [
             cp_model_cplex.end_of(self.task_interval[(self.num_mb - 1, 2, dev)])
             - cp_model_cplex.start_of(self.task_interval[(0, 0, dev)])
-            - self.num_mb * int(sys_cfg.T_F[dev] + sys_cfg.T_B[dev] + sys_cfg.T_W[dev])
+            - self.num_mb * int(sys_cfg.T_F[0][dev] + sys_cfg.T_B[0][dev] + sys_cfg.T_W[0][dev])
             for dev in range(self.num_dev)
         ]
         self.model.add(cp_model_cplex.max(bubble_terms) == self.bubble)
@@ -343,18 +405,17 @@ class ZBWaveCPLEXScheduler:
         self.sys_cfg = sys_cfg
         self.num_dev = sys_cfg.num_devices
         assert sys_cfg.num_chunks == 2
+        self.num_chunks = sys_cfg.num_chunks
         self.num_mb = sys_cfg.num_microbatches
+        self.zero_1_dp_modeling = sys_cfg.zero_1_dp_modeling
         self.solved = False
         self.cp_context = cp_context
-        # self.cp_context.solver.local.execfile = (
-        #     "/capstor/scratch/cscs/ctianche/projects/crossdc/Megatron-LM/megatron/core/pipeline_parallel/cdc_scheduler/pp_generator/run_cpoptimizer.sh"
-        # )
         self.solution: Optional[cp_model_cplex.CpoSolveResult] = None
 
         # Compute horizon (max time)
         comm_round_trip = sum(
             [
-                sys_cfg.T_C[i][i + 1] + sys_cfg.T_C[i + 1][i]
+                sys_cfg.T_alpha[i][i + 1] + sys_cfg.T_alpha[i + 1][i]
                 for i in range(self.num_dev - 1)
             ]
         ) + sum(
@@ -365,12 +426,19 @@ class ZBWaveCPLEXScheduler:
         )
         compute_round_trip = sum(
             [
-                sys_cfg.T_F[i] + sys_cfg.T_B[i] + sys_cfg.T_W[i]
+                sys_cfg.T_F[0][i] + sys_cfg.T_B[0][i] + sys_cfg.T_W[0][i]
                 for i in range(self.num_dev)
             ]
         )
-        self.horizon = 2 * int((comm_round_trip + compute_round_trip) * self.num_mb)
-        # print(f"Horizon: {self.horizon}")
+        dp_comm = sum(
+            [
+                sys_cfg.T_DP[i][j][0] + sys_cfg.T_DP[i][j][1]
+                for i in range(self.num_chunks)
+                for j in range(self.num_dev)
+            ]
+        ) if self.zero_1_dp_modeling else 0
+        
+        self.horizon = 2 * int((comm_round_trip + compute_round_trip + dp_comm) * self.num_mb)
 
         # Create the model
         self.model = cp_model_cplex.CpoModel()
@@ -385,6 +453,10 @@ class ZBWaveCPLEXScheduler:
         self.communication_intervals: Dict[
             Tuple[int, int, int, int], cp_model_cplex.CpoIntervalVar
         ] = {}
+        # (dev, chunk, 2) -> interval
+        self.dp_comm_interval: Dict[
+            Tuple[int, int, int], cp_model_cplex.CpoIntervalVar
+        ] = {}
         self.task_to_send_comm: Dict[cp_model_cplex.CpoIntervalVar, cp_model_cplex.CpoIntervalVar] = {}
 
         # Create interval variables
@@ -394,9 +466,9 @@ class ZBWaveCPLEXScheduler:
                 for task_type in range(3):
                     for chunk in range(2):
                         t_interval = [
-                            sys_cfg.T_F[dev],
-                            sys_cfg.T_B[dev],
-                            sys_cfg.T_W[dev],
+                            sys_cfg.T_F[chunk][dev],
+                            sys_cfg.T_B[chunk][dev],
+                            sys_cfg.T_W[chunk][dev],
                         ][task_type]
                         interval_var = cp_model_cplex.interval_var(
                             size=int(t_interval),
@@ -406,7 +478,7 @@ class ZBWaveCPLEXScheduler:
                         self.task_interval[(mb, task_type, chunk, dev)] = interval_var
 
                         memory_increase = int(
-                            [sys_cfg.M_F[dev], sys_cfg.M_B[dev], sys_cfg.M_W[dev]][
+                            [sys_cfg.M_F[chunk][dev], sys_cfg.M_B[chunk][dev], sys_cfg.M_W[chunk][dev]][
                                 task_type
                             ]
                         )
@@ -470,6 +542,31 @@ class ZBWaveCPLEXScheduler:
                 )
             )
 
+        if self.zero_1_dp_modeling:
+            for chunk in range(2):
+                for dev in range(self.num_dev):
+                    interval_var = cp_model_cplex.interval_var(
+                        size=int(sys_cfg.T_DP[chunk][dev][0]),
+                        name=f"dp_ag_interval_{dev}_{chunk}",
+                        start=(0, self.horizon),
+                    )
+                    self.dp_comm_interval[(dev, chunk, 0)] = interval_var
+                    interval_var = cp_model_cplex.interval_var(
+                        size=int(sys_cfg.T_DP[chunk][dev][1]),
+                        name=f"dp_rs_interval_{dev}_{chunk}",
+                        start=(0, self.horizon),
+                    )
+                    self.dp_comm_interval[(dev, chunk, 1)] = interval_var
+            
+            for dev in range(self.num_dev):
+                cp_model_cplex.no_overlap(
+                    [
+                        self.dp_comm_interval[(dev, chunk, i)]
+                        for chunk in range(2)
+                        for i in range(2)
+                    ]
+                )
+
         # No overlap constraints
         for dev in range(self.num_dev):
             self.model.add(
@@ -518,6 +615,23 @@ class ZBWaveCPLEXScheduler:
                     )
                 )
 
+        # DP comm constraints
+        if self.zero_1_dp_modeling:
+            for dev in range(self.num_dev):
+                for chunk in range(2):
+                    self.model.add(
+                        cp_model_cplex.end_before_start(
+                            self.dp_comm_interval[(dev, chunk, 0)],
+                            self.task_interval[(0, 0, chunk, dev)],
+                        )
+                    )
+                    self.model.add(
+                        cp_model_cplex.end_before_start(
+                            self.task_interval[(self.num_mb - 1, 2, chunk, dev)],
+                            self.dp_comm_interval[(dev, chunk, 1)],
+                        )
+                    )
+
         # Microbatch ordering constraints
         for mb in range(1, self.num_mb):
             for dev in range(self.num_dev):
@@ -534,7 +648,7 @@ class ZBWaveCPLEXScheduler:
         for mb in range(self.num_mb):
             for dev in range(self.num_dev - 1):
                 # F0 & B1
-                forward_delay = int(sys_cfg.T_C[dev][dev + 1])
+                forward_delay = int(sys_cfg.T_alpha[dev][dev + 1])
                 if self.sys_cfg.T_beta[dev][dev + 1] == 0:
                     # F0
                     self.model.add(
@@ -584,7 +698,7 @@ class ZBWaveCPLEXScheduler:
                         )
                     )
                 # F1 & B0
-                backward_delay = int(sys_cfg.T_C[dev + 1][dev])
+                backward_delay = int(sys_cfg.T_alpha[dev + 1][dev])
                 if self.sys_cfg.T_beta[dev + 1][dev] == 0:
                     # F1
                     self.model.add(
@@ -634,34 +748,46 @@ class ZBWaveCPLEXScheduler:
                         )
                     )
 
-        # First task starts at time 0
-        self.model.add(cp_model_cplex.start_of(self.task_interval[(0, 0, 0, 0)]) == 0)
+        if self.zero_1_dp_modeling:
+            self.model.add(cp_model_cplex.start_of(self.dp_comm_interval[(0, 0, 0)]) == 0)
+        else:
+            # First task starts at time 0
+            self.model.add(cp_model_cplex.start_of(self.task_interval[(0, 0, 0, 0)]) == 0)
 
         # Objective variables
         self.dev_span = cp_model_cplex.integer_var(0, self.horizon, name="dev_span")
         self.bubble = cp_model_cplex.integer_var(0, self.horizon, name="bubble")
 
-        # Maximum completion time across all devices
-        self.model.add(
-            cp_model_cplex.max(
+        if self.zero_1_dp_modeling:
+            self.model.add(cp_model_cplex.max(
                 [
-                    cp_model_cplex.end_of(
-                        self.task_interval[(self.num_mb - 1, 2, 0, dev)]
-                    )
-                    - cp_model_cplex.start_of(self.task_interval[(0, 0, 0, dev)])
+                    cp_model_cplex.end_of(self.dp_comm_interval[(dev, chunk, 1)])
+                    - cp_model_cplex.start_of(self.dp_comm_interval[(dev, 0, 0)])
                     for dev in range(self.num_dev)
+                    for chunk in range(2)
                 ]
+            ) == self.dev_span)
+        else:
+            # Maximum completion time across all devices
+            self.model.add(
+                cp_model_cplex.max(
+                    [
+                        cp_model_cplex.end_of(
+                            self.task_interval[(self.num_mb - 1, 2, 0, dev)]
+                        )
+                        - cp_model_cplex.start_of(self.task_interval[(0, 0, 0, dev)])
+                        for dev in range(self.num_dev)
+                    ]
+                )
+                == self.dev_span
             )
-            == self.dev_span
-        )
 
         # Bubble time calculation
         bubble_terms = [
             cp_model_cplex.end_of(self.task_interval[(self.num_mb - 1, 2, 0, dev)])
             - cp_model_cplex.start_of(self.task_interval[(0, 0, 0, dev)])
             - self.num_mb
-            * 2
-            * int(sys_cfg.T_F[dev] + sys_cfg.T_B[dev] + sys_cfg.T_W[dev])
+            * int(sum([sys_cfg.T_F[chunk][dev] + sys_cfg.T_B[chunk][dev] + sys_cfg.T_W[chunk][dev] for chunk in range(2)]))
             for dev in range(self.num_dev)
         ]
         self.model.add(cp_model_cplex.max(bubble_terms) == self.bubble)
@@ -674,44 +800,6 @@ class ZBWaveCPLEXScheduler:
             raise NotImplementedError(
                 "Warm start not implemented for ZBWaveCPLEXScheduler"
             )
-
-    #         self.set_hint_schedule()
-
-    # def set_hint_schedule(self):
-    #     """Set warm start solution using heuristic schedule"""
-    #     from pipeline import HeuristicZBUDPipeline
-
-    #     # Generate heuristic schedule
-    #     hint_pp = HeuristicZBUDPipeline(self.sys_cfg)
-    #     hint_pp.schedule()
-    #     hint_pp.solve_dependencies()
-    #     # hint_pp.print_schedule(save=True, name="hint_schedule")
-    #     dev_span_hint = hint_pp.get_schedule_time(device_wise=True)
-    #     dev_tasks = hint_pp.device_scheduled_tasks
-
-    #     # Create a warm start solution
-    #     warm_start_solution = self.model.create_empty_solution()
-
-    #     # Add interval variable assignments
-    #     for dev in range(self.num_dev):
-    #         for task in dev_tasks[dev]:
-    #             str_to_type = {"F": 0, "B": 1, "W": 2}
-    #             task_type = str_to_type[task.task_type]
-    #             mb_id = task.microbatch_id
-
-    #             interval_var = self.task_interval[(mb_id, task_type, dev)]
-    #             warm_start_solution.add_interval_var_solution(
-    #                 interval_var,
-    #                 presence=True,
-    #                 start=int(task.start_time),
-    #                 end=int(task.completion_time),
-    #             )
-
-    #     # Add objective variable hints
-    #     warm_start_solution.add_integer_var_solution(self.dev_span, int(dev_span_hint))
-
-    #     # Set the warm start solution
-    #     self.model.set_starting_point(warm_start_solution)
 
     def solve(self, logging=False, time_limit_sec=600, relative_gap=0.0001, workers=64):
         # Configure solver parameters
@@ -738,6 +826,9 @@ class ZBWaveCPLEXScheduler:
             for mb in range(self.num_mb):
                 for task_type in range(3):
                     for chunk in range(2):
+                        start_time = self.solution.get_value(
+                            self.task_interval[(mb, task_type, chunk, dev)]
+                        )[0]
                         end_time = self.solution.get_value(
                             self.task_interval[(mb, task_type, chunk, dev)]
                         )[1]
@@ -752,6 +843,7 @@ class ZBWaveCPLEXScheduler:
                                 mb_id=mb,
                                 task_type=["F", "B", "W"][task_type],
                                 chunk_id=chunk,
+                                start_time=start_time,
                                 end_time=end_time,
                                 post_send_time=post_send_time,
                             )
@@ -766,18 +858,17 @@ class ZBLoopCPLEXScheduler:
         self.num_dev = sys_cfg.num_devices
         assert self.num_dev > 2, "currently only support more than 2 devices"
         assert sys_cfg.num_chunks == 2
+        self.num_chunks = sys_cfg.num_chunks
         self.num_mb = sys_cfg.num_microbatches
+        self.zero_1_dp_modeling = sys_cfg.zero_1_dp_modeling
         self.solved = False
         self.cp_context = cp_context
-        # self.cp_context.solver.local.execfile = (
-        #     "/users/ctianche/cplex/cpoptimizer/bin/x86-64_linux/cpoptimizer"
-        # )
         self.solution: Optional[cp_model_cplex.CpoSolveResult] = None
         
         # Compute horizon (max time)
         comm_round_trip = sum(
             [
-                sys_cfg.T_C[i][i + 1] + sys_cfg.T_C[i + 1][i]
+                sys_cfg.T_alpha[i][i + 1] + sys_cfg.T_alpha[i + 1][i]
                 for i in range(self.num_dev - 1)
             ]
         ) + sum(
@@ -788,11 +879,19 @@ class ZBLoopCPLEXScheduler:
         )
         compute_round_trip = sum(
             [
-                sys_cfg.T_F[i] + sys_cfg.T_B[i] + sys_cfg.T_W[i]
+                sys_cfg.T_F[chunk][i] + sys_cfg.T_B[chunk][i] + sys_cfg.T_W[chunk][i]
+                for chunk in range(self.num_chunks)
                 for i in range(self.num_dev)
             ]
         )
-        self.horizon = 4 * int((comm_round_trip + compute_round_trip) * self.num_mb)
+        dp_comm = sum(
+            [
+                sys_cfg.T_DP[0][i][0] + sys_cfg.T_DP[0][i][1]
+                for i in range(self.num_dev)
+            ]
+        ) if self.zero_1_dp_modeling else 0
+        
+        self.horizon = 4 * int((comm_round_trip + compute_round_trip + dp_comm) * self.num_mb)
 
         # Create the model
         self.model = cp_model_cplex.CpoModel()
@@ -807,6 +906,10 @@ class ZBLoopCPLEXScheduler:
         self.communication_intervals: Dict[
             Tuple[int, int, int, int], cp_model_cplex.CpoIntervalVar
         ] = {}
+        # (dev, chunk, 2) -> interval
+        self.dp_comm_interval: Dict[
+            Tuple[int, int, int], cp_model_cplex.CpoIntervalVar
+        ] = {}
         self.task_to_send_comm: Dict[cp_model_cplex.CpoIntervalVar, cp_model_cplex.CpoIntervalVar] = {}
 
         # Create interval variables
@@ -816,9 +919,9 @@ class ZBLoopCPLEXScheduler:
                 for task_type in range(3):
                     for chunk in range(2):
                         t_interval = [
-                            sys_cfg.T_F[dev],
-                            sys_cfg.T_B[dev],
-                            sys_cfg.T_W[dev],
+                            sys_cfg.T_F[chunk][dev],
+                            sys_cfg.T_B[chunk][dev],
+                            sys_cfg.T_W[chunk][dev],
                         ][task_type]
                         interval_var = cp_model_cplex.interval_var(
                             size=int(t_interval),
@@ -828,7 +931,7 @@ class ZBLoopCPLEXScheduler:
                         self.task_interval[(mb, task_type, chunk, dev)] = interval_var
 
                         memory_increase = int(
-                            [sys_cfg.M_F[dev], sys_cfg.M_B[dev], sys_cfg.M_W[dev]][
+                            [sys_cfg.M_F[chunk][dev], sys_cfg.M_B[chunk][dev], sys_cfg.M_W[chunk][dev]][
                                 task_type
                             ]
                         )
@@ -902,6 +1005,31 @@ class ZBLoopCPLEXScheduler:
                 continue                
             self.model.add(cp_model_cplex.no_overlap(intervals))
 
+        if self.zero_1_dp_modeling:
+            for chunk in range(2):
+                for dev in range(self.num_dev):
+                    interval_var = cp_model_cplex.interval_var(
+                        size=int(sys_cfg.T_DP[chunk][dev][0]),
+                        name=f"dp_ag_interval_{dev}_{chunk}",
+                        start=(0, self.horizon),
+                    )
+                    self.dp_comm_interval[(dev, chunk, 0)] = interval_var
+                    interval_var = cp_model_cplex.interval_var(
+                        size=int(sys_cfg.T_DP[chunk][dev][1]),
+                        name=f"dp_rs_interval_{dev}_{chunk}",
+                        start=(0, self.horizon),
+                    )
+                    self.dp_comm_interval[(dev, chunk, 1)] = interval_var
+            
+            for dev in range(self.num_dev):
+                cp_model_cplex.no_overlap(
+                    [
+                        self.dp_comm_interval[(dev, chunk, i)]
+                        for chunk in range(2)
+                        for i in range(2)
+                    ]
+                )
+
         # No overlap constraints
         for dev in range(self.num_dev):
             self.model.add(
@@ -950,6 +1078,23 @@ class ZBLoopCPLEXScheduler:
                     )
                 )
 
+        # DP comm constraints
+        if self.zero_1_dp_modeling:
+            for dev in range(self.num_dev):
+                for chunk in range(2):
+                    self.model.add(
+                        cp_model_cplex.end_before_start(
+                            self.dp_comm_interval[(dev, chunk, 0)],
+                            self.task_interval[(0, 0, chunk, dev)],
+                        )
+                    )
+                    self.model.add(
+                        cp_model_cplex.end_before_start(
+                            self.task_interval[(self.num_mb - 1, 2, chunk, dev)],
+                            self.dp_comm_interval[(dev, chunk, 1)],
+                        )
+                    )
+
         # Microbatch ordering constraints
         for mb in range(1, self.num_mb):
             for dev in range(self.num_dev):
@@ -966,7 +1111,7 @@ class ZBLoopCPLEXScheduler:
         for mb in range(self.num_mb):
             for dev in range(self.num_dev - 1):
                 # F0 & F1
-                forward_delay = int(sys_cfg.T_C[dev][dev + 1])
+                forward_delay = int(sys_cfg.T_alpha[dev][dev + 1])
                 if self.sys_cfg.T_beta[dev][dev + 1] == 0:
                     # F0
                     self.model.add(
@@ -1016,7 +1161,7 @@ class ZBLoopCPLEXScheduler:
                         )
                     )
                 # B1 & B0
-                backward_delay = int(sys_cfg.T_C[dev + 1][dev])
+                backward_delay = int(sys_cfg.T_alpha[dev + 1][dev])
                 if self.sys_cfg.T_beta[dev + 1][dev] == 0:
                     # B1
                     self.model.add(
@@ -1069,7 +1214,7 @@ class ZBLoopCPLEXScheduler:
         for mb in range(self.num_mb):
             first = 0
             last = self.num_dev - 1
-            forward_delay = int(sys_cfg.T_C[last][first])
+            forward_delay = int(sys_cfg.T_alpha[last][first])
             if self.sys_cfg.T_beta[last][first] == 0:
                 # F0
                 self.model.add(
@@ -1095,7 +1240,7 @@ class ZBLoopCPLEXScheduler:
                         delay=forward_delay if forward_delay > 0 else None,
                     )
                 )
-            backward_delay = int(sys_cfg.T_C[first][last])
+            backward_delay = int(sys_cfg.T_alpha[first][last])
             if self.sys_cfg.T_beta[first][last] == 0:
                 # B1
                 self.model.add(
@@ -1121,36 +1266,47 @@ class ZBLoopCPLEXScheduler:
                         delay=backward_delay if backward_delay > 0 else None,
                     )
                 )
-            
 
-        # First task starts at time 0
-        self.model.add(cp_model_cplex.start_of(self.task_interval[(0, 0, 0, 0)]) == 0)
+        if self.zero_1_dp_modeling:
+            self.model.add(cp_model_cplex.start_of(self.dp_comm_interval[(0, 0, 0)]) == 0)
+        else:
+            # First task starts at time 0
+            self.model.add(cp_model_cplex.start_of(self.task_interval[(0, 0, 0, 0)]) == 0)
 
         # Objective variables
         self.dev_span = cp_model_cplex.integer_var(0, self.horizon, name="dev_span")
         self.bubble = cp_model_cplex.integer_var(0, self.horizon, name="bubble")
 
-        # Maximum completion time across all devices
-        self.model.add(
-            cp_model_cplex.max(
+        if self.zero_1_dp_modeling:
+            self.model.add(cp_model_cplex.max(
                 [
-                    cp_model_cplex.end_of(
-                        self.task_interval[(self.num_mb - 1, 2, 0, dev)]
-                    )
-                    - cp_model_cplex.start_of(self.task_interval[(0, 0, 0, dev)])
+                    cp_model_cplex.end_of(self.dp_comm_interval[(dev, chunk, 1)])
+                    - cp_model_cplex.start_of(self.dp_comm_interval[(dev, 0, 0)])
                     for dev in range(self.num_dev)
+                    for chunk in range(2)
                 ]
+            ) == self.dev_span)
+        else:
+            # Maximum completion time across all devices
+            self.model.add(
+                cp_model_cplex.max(
+                    [
+                        cp_model_cplex.end_of(
+                            self.task_interval[(self.num_mb - 1, 2, 0, dev)]
+                        )
+                        - cp_model_cplex.start_of(self.task_interval[(0, 0, 0, dev)])
+                        for dev in range(self.num_dev)
+                    ]
+                )
+                == self.dev_span
             )
-            == self.dev_span
-        )
 
         # Bubble time calculation
         bubble_terms = [
             cp_model_cplex.end_of(self.task_interval[(self.num_mb - 1, 2, 0, dev)])
             - cp_model_cplex.start_of(self.task_interval[(0, 0, 0, dev)])
             - self.num_mb
-            * 2
-            * int(sys_cfg.T_F[dev] + sys_cfg.T_B[dev] + sys_cfg.T_W[dev])
+            * int(sum([sys_cfg.T_F[chunk][dev] + sys_cfg.T_B[chunk][dev] + sys_cfg.T_W[chunk][dev] for chunk in range(2)]))
             for dev in range(self.num_dev)
         ]
         self.model.add(cp_model_cplex.max(bubble_terms) == self.bubble)
@@ -1161,46 +1317,8 @@ class ZBLoopCPLEXScheduler:
 
         if warm_start:
             raise NotImplementedError(
-                "Warm start not implemented for ZBWaveCPLEXScheduler"
+                "Warm start not implemented for ZBLoopCPLEXScheduler"
             )
-
-    #         self.set_hint_schedule()
-
-    # def set_hint_schedule(self):
-    #     """Set warm start solution using heuristic schedule"""
-    #     from pipeline import HeuristicZBUDPipeline
-
-    #     # Generate heuristic schedule
-    #     hint_pp = HeuristicZBUDPipeline(self.sys_cfg)
-    #     hint_pp.schedule()
-    #     hint_pp.solve_dependencies()
-    #     # hint_pp.print_schedule(save=True, name="hint_schedule")
-    #     dev_span_hint = hint_pp.get_schedule_time(device_wise=True)
-    #     dev_tasks = hint_pp.device_scheduled_tasks
-
-    #     # Create a warm start solution
-    #     warm_start_solution = self.model.create_empty_solution()
-
-    #     # Add interval variable assignments
-    #     for dev in range(self.num_dev):
-    #         for task in dev_tasks[dev]:
-    #             str_to_type = {"F": 0, "B": 1, "W": 2}
-    #             task_type = str_to_type[task.task_type]
-    #             mb_id = task.microbatch_id
-
-    #             interval_var = self.task_interval[(mb_id, task_type, dev)]
-    #             warm_start_solution.add_interval_var_solution(
-    #                 interval_var,
-    #                 presence=True,
-    #                 start=int(task.start_time),
-    #                 end=int(task.completion_time),
-    #             )
-
-    #     # Add objective variable hints
-    #     warm_start_solution.add_integer_var_solution(self.dev_span, int(dev_span_hint))
-
-    #     # Set the warm start solution
-    #     self.model.set_starting_point(warm_start_solution)
 
     def solve(self, logging=False, time_limit_sec=600, relative_gap=0.0001, workers=64):
         # Configure solver parameters

@@ -4,7 +4,6 @@ import torch
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-@torch.compile
 class CompiledRMSNorm(torch.nn.Module):
     def __init__(self, config: TransformerConfig, hidden_size: int, eps: float = 1e-5):
         super().__init__()
@@ -21,6 +20,7 @@ class CompiledRMSNorm(torch.nn.Module):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)
 
+    @torch.compile
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         output = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         return output * self.weight

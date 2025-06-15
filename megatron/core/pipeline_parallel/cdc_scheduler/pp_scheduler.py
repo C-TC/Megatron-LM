@@ -122,7 +122,6 @@ class CDCDynamicScheduleGenerator:
     ) -> None:
         self.args = args
         self.schedule_type = schedule_type
-        # TODO: cdc: support more schedule types
         assert self.schedule_type in [
             "wave",
             "ud",
@@ -132,6 +131,7 @@ class CDCDynamicScheduleGenerator:
         self.num_microbatch = num_microbatch
         self.profile_result_path = profile_result_path
         self.initialized = False
+        self.zero1_dp_modeling = args.zero1_dp_modeling
 
     def initialize(self):
         # Initialize after profile result is available
@@ -145,20 +145,28 @@ class CDCDynamicScheduleGenerator:
 
         with open(os.path.join(self.profile_result_path, "total.json"), "r") as f:
             profile_result = json.load(f)
-        self.T_F_list = profile_result["T_F"]
-        self.T_B_list = profile_result["T_B"]
-        self.T_W_list = profile_result["T_W"]
-        self.T_C_matrix = np.array(profile_result["T_C"])
+        self.T_F_list = np.array(profile_result["T_F"])
+        self.T_B_list = np.array(profile_result["T_B"])
+        self.T_W_list = np.array(profile_result["T_W"])
+        self.T_alpha_matrix = np.array(profile_result["T_alpha"])
         self.T_bw_matrix = np.array(profile_result["T_bw"])
-        self.M_F_list = profile_result["M_F"]
-        self.M_B_list = profile_result["M_B"]
-        self.M_W_list = profile_result["M_W"]
-        self.M_Limit_list = profile_result["M_Limit"]
-        self.M_base_list = profile_result["M_base"]
+        self.M_F_list = np.array(profile_result["M_F"])
+        self.M_B_list = np.array(profile_result["M_B"])
+        self.M_W_list = np.array(profile_result["M_W"])
+        self.M_Limit_list = np.array(profile_result["M_Limit"])
+        self.M_base_list = np.array(profile_result["M_base"])
         self.device_max_mem = float(profile_result["M_dev_max"])
+        self.T_DP_list = np.array(profile_result["T_DP"])
         
 
-        assert len(self.T_F_list) == self.pp_size
+        assert self.T_F_list.shape == (self.num_chunks, self.pp_size)
+        assert self.T_B_list.shape == (self.num_chunks, self.pp_size)
+        assert self.T_W_list.shape == (self.num_chunks, self.pp_size)
+        assert self.T_alpha_matrix.shape == (self.pp_size, self.pp_size)
+        assert self.T_bw_matrix.shape == (self.pp_size, self.pp_size)
+        assert self.M_F_list.shape == (self.num_chunks, self.pp_size)
+        assert self.M_B_list.shape == (self.num_chunks, self.pp_size)
+        assert self.M_W_list.shape == (self.num_chunks, self.pp_size)
 
         self.pipeline: Pipeline | None = None
 
@@ -180,15 +188,16 @@ class CDCDynamicScheduleGenerator:
         ) as f:
             json.dump(
                 {
-                    "T_F": sys_cfg.T_F,
-                    "T_B": sys_cfg.T_B,
-                    "T_W": sys_cfg.T_W,
-                    "T_C": sys_cfg.T_C.tolist(),
-                    "T_beta": sys_cfg.T_beta.tolist(),
-                    "M_F": sys_cfg.M_F,
-                    "M_B": sys_cfg.M_B,
-                    "M_W": sys_cfg.M_W,
-                    "M_Limit": sys_cfg.M_Limit,
+                    "T_F": tolist_if_needed(sys_cfg.T_F),
+                    "T_B": tolist_if_needed(sys_cfg.T_B),
+                    "T_W": tolist_if_needed(sys_cfg.T_W),
+                    "T_alpha": tolist_if_needed(sys_cfg.T_alpha),
+                    "T_beta": tolist_if_needed(sys_cfg.T_beta),
+                    "T_DP": tolist_if_needed(sys_cfg.T_DP),
+                    "M_F": tolist_if_needed(sys_cfg.M_F),
+                    "M_B": tolist_if_needed(sys_cfg.M_B),
+                    "M_W": tolist_if_needed(sys_cfg.M_W),
+                    "M_Limit": tolist_if_needed(sys_cfg.M_Limit),
                     "num_devices": sys_cfg.num_devices,
                     "num_microbatches": sys_cfg.num_microbatches,
                     "num_chunks": sys_cfg.num_chunks,
@@ -214,10 +223,10 @@ class CDCDynamicScheduleGenerator:
             dst = boundary % self.pp_size
             if latency_seconds is not None:
                 self.injected_latency[src, dst] = max(
-                    0, latency_seconds - self.T_C_matrix[src, dst]
+                    0, latency_seconds - self.T_alpha_matrix[src, dst]
                 )
                 self.injected_latency[dst, src] = max(
-                    0, latency_seconds - self.T_C_matrix[dst, src]
+                    0, latency_seconds - self.T_alpha_matrix[dst, src]
                 )
             if bandwidth_seconds is not None:
                 self.injected_bandwidth[src, dst] = max(
@@ -231,26 +240,44 @@ class CDCDynamicScheduleGenerator:
         assert self.initialized
         # M_F if no recompute, (M_F + M_B) if recompute
         for i in range(self.pp_size):
-            unit_memory = max(self.M_F_list[i], self.M_F_list[i] + self.M_B_list[i])
+            unit_memory = max([self.M_F_list[chunk][i] for chunk in range(self.num_chunks)] + [self.M_F_list[chunk][i] + self.M_B_list[chunk][i] for chunk in range(self.num_chunks)])
             new_mem_limit = self.pp_size * self.num_chunks * (1 + extra_mem_factor) * unit_memory * 1.02
             self.M_Limit_list[i] = min(new_mem_limit, (self.device_max_mem - self.M_base_list[i]) * 0.96)
 
     def integerize_sys_cfg(self, sys_cfg: SystemConfig, multiply_factor: int = 1) -> SystemConfig:
-        time_candidate = []
-        memory_candidate = []
+        time_candidate = set()
+        memory_candidate = set()
+        # Assume T_F, T_B, T_W are 2D lists, T_DP is 3D list
+        def flatten_to_scalars(x):
+            if isinstance(x, np.ndarray):
+                # Use .flat for NumPy arrays
+                for item in x.flat:
+                    yield item
+            elif isinstance(x, (list, tuple)):
+                for item in x:
+                    yield from flatten_to_scalars(item)
+            else:
+                yield x
+        
         for work_list in [
             sys_cfg.T_F,
             sys_cfg.T_B,
-            sys_cfg.T_C,
+            sys_cfg.T_alpha,
             sys_cfg.T_beta,
             sys_cfg.T_W,
+            sys_cfg.T_DP,
         ]:
-            time_candidate.append(np.max(work_list))
+            # add to a set and turn it into a list
+            # work_list can be np array or 1d or 2d list
+            time_candidate.update(flatten_to_scalars(work_list))
         for work_list in [sys_cfg.M_F, sys_cfg.M_B, sys_cfg.M_W, sys_cfg.M_Limit]:
-            memory_candidate.append(np.max(work_list))
+            memory_candidate.update(flatten_to_scalars(work_list))
+        
+        time_candidate = list(time_candidate)
+        memory_candidate = list(memory_candidate)
 
         def scale_to_integers_factor(
-            candidate_list, target_min_diff=10, max_abs_value=100000
+            candidate_list, target_min_diff=4, max_abs_value=100000
         ):
             values = np.abs(candidate_list)
             sorted_values = np.sort(values)
@@ -269,40 +296,36 @@ class CDCDynamicScheduleGenerator:
         time_scaling_factor = scale_to_integers_factor(time_candidate)
         memory_scaling_factor = scale_to_integers_factor(memory_candidate)
 
-        new_T_F = [int(np.round(t * time_scaling_factor)) * multiply_factor for t in sys_cfg.T_F]
-        new_T_B = [int(np.round(t * time_scaling_factor)) * multiply_factor for t in sys_cfg.T_B]
-        new_T_C = np.array(
-            [
-                [int(np.round(t * time_scaling_factor)) * multiply_factor for t in row]
-                for row in sys_cfg.T_C
-            ]
-        )
-        new_T_beta = np.array(
-            [
-                [int(np.round(t * time_scaling_factor)) * multiply_factor for t in row]
-                for row in sys_cfg.T_beta
-            ]
-        )
-        new_T_W = [int(np.round(t * time_scaling_factor)) * multiply_factor for t in sys_cfg.T_W]
-        new_M_F = [int(np.round(m * memory_scaling_factor)) * multiply_factor for m in sys_cfg.M_F]
-        new_M_B = [int(np.round(m * memory_scaling_factor)) * multiply_factor for m in sys_cfg.M_B]
-        new_M_W = [-new_M_F[i] - new_M_B[i] for i in range(len(new_M_F))]
-        new_M_Limit = [
-            int(np.round(m * memory_scaling_factor)) * multiply_factor for m in sys_cfg.M_Limit
-        ]
+        def scale_list(lst, factor):
+            if isinstance(lst, list):
+                lst = np.array(lst)
+            return ((lst * factor).astype(int) * multiply_factor)
+
+        new_T_F = scale_list(sys_cfg.T_F, time_scaling_factor)
+        new_T_B = scale_list(sys_cfg.T_B, time_scaling_factor)
+        new_T_alpha = scale_list(sys_cfg.T_alpha, time_scaling_factor)
+        new_T_beta = scale_list(sys_cfg.T_beta, time_scaling_factor)
+        new_T_W = scale_list(sys_cfg.T_W, time_scaling_factor)
+        new_T_DP = scale_list(sys_cfg.T_DP, time_scaling_factor)
+        new_M_F = scale_list(sys_cfg.M_F, memory_scaling_factor)
+        new_M_B = scale_list(sys_cfg.M_B, memory_scaling_factor)
+        new_M_W = np.array([[-new_M_F[i][j] - new_M_B[i][j] for j in range(len(new_M_F[0]))] for i in range(len(new_M_F))], dtype=int)
+        new_M_Limit = scale_list(sys_cfg.M_Limit, memory_scaling_factor)
         return SystemConfig(
             T_F=new_T_F,
             T_B=new_T_B,
-            T_C=new_T_C,
+            T_alpha=new_T_alpha,
             T_beta=new_T_beta,
             T_W=new_T_W,
             M_F=new_M_F,
             M_B=new_M_B,
             M_W=new_M_W,
             M_Limit=new_M_Limit,
+            T_DP=new_T_DP,
             num_devices=sys_cfg.num_devices,
             num_microbatches=sys_cfg.num_microbatches,
             num_chunks=sys_cfg.num_chunks,
+            zero_1_dp_modeling=self.zero1_dp_modeling,
         ), time_scaling_factor * multiply_factor, memory_scaling_factor * multiply_factor
 
     def generate_schedule_from_profile(self) -> int:
@@ -315,16 +338,18 @@ class CDCDynamicScheduleGenerator:
             sys_cfg = SystemConfig(
                 T_F=self.T_F_list,
                 T_B=self.T_B_list,
-                T_C=self.T_C_matrix + self.injected_latency,
+                T_alpha=self.T_alpha_matrix + self.injected_latency,
                 T_beta=self.T_bw_matrix + self.injected_bandwidth,
                 T_W=self.T_W_list,
                 M_F=self.M_F_list,
                 M_B=self.M_B_list,
                 M_W=self.M_W_list,
                 M_Limit=self.M_Limit_list,
+                T_DP=self.T_DP_list,
                 num_devices=self.pp_size,
                 num_microbatches=self.num_microbatch,
                 num_chunks=num_chunks,
+                zero_1_dp_modeling=self.zero1_dp_modeling,
             )
             sys_cfg, time_factor, mem_factor = self.integerize_sys_cfg(sys_cfg)
             if self.rank_zero:
@@ -396,16 +421,18 @@ class CDCDynamicScheduleGenerator:
             sys_cfg = SystemConfig(
                 T_F=self.T_F_list,
                 T_B=self.T_B_list,
-                T_C=self.T_C_matrix + self.injected_latency,
+                T_alpha=self.T_alpha_matrix + self.injected_latency,
                 T_beta=self.T_bw_matrix + self.injected_bandwidth,
                 T_W=self.T_W_list,
                 M_F=self.M_F_list,
                 M_B=self.M_B_list,
                 M_W=self.M_W_list,
                 M_Limit=self.M_Limit_list,
+                T_DP=self.T_DP_list,
                 num_devices=self.pp_size,
                 num_microbatches=self.num_microbatch,
                 num_chunks=num_chunks,
+                zero_1_dp_modeling=self.zero1_dp_modeling,
             )
             sys_cfg, time_factor, mem_factor = self.integerize_sys_cfg(sys_cfg)
             if self.rank_zero:
@@ -475,16 +502,18 @@ class CDCDynamicScheduleGenerator:
             sys_cfg = SystemConfig(
                 T_F=self.T_F_list,
                 T_B=self.T_B_list,
-                T_C=self.T_C_matrix + self.injected_latency,
+                T_alpha=self.T_alpha_matrix + self.injected_latency,
                 T_beta=self.T_bw_matrix + self.injected_bandwidth,
                 T_W=self.T_W_list,
                 M_F=self.M_F_list,
                 M_B=self.M_B_list,
                 M_W=self.M_W_list,
                 M_Limit=self.M_Limit_list,
+                T_DP=self.T_DP_list,
                 num_devices=self.pp_size,
                 num_microbatches=self.num_microbatch,
                 num_chunks=num_chunks,
+                zero_1_dp_modeling=self.zero1_dp_modeling,
             )
             
             num_subparts = self.args.num_subparts
@@ -744,13 +773,14 @@ class CDCPPScheduler:
         if self.use_static_schedule:
             with open(os.path.join(self.exp_manager.profile_result_path, "total.json"), "r") as f:
                 profile_result = json.load(f)
-            T_F_list = profile_result["T_F"]
-            T_B_list = profile_result["T_B"]
-            T_W_list = profile_result["T_W"]
-            M_F_list = profile_result["M_F"]
-            M_B_list = profile_result["M_B"]
-            M_W_list = profile_result["M_W"]
-            M_Limit_list = profile_result["M_Limit"]
+            T_F_list = np.array(profile_result["T_F"])
+            T_B_list = np.array(profile_result["T_B"])
+            T_W_list = np.array(profile_result["T_W"])
+            T_DP_list = np.array(profile_result["T_DP"])
+            M_F_list = np.array(profile_result["M_F"])
+            M_B_list = np.array(profile_result["M_B"])
+            M_W_list = np.array(profile_result["M_W"])
+            M_Limit_list = np.array(profile_result["M_Limit"])
             pp_size = self.args.pipeline_model_parallel_size
             new_latency_matrix = np.zeros((pp_size, pp_size))
             new_bandwidth_matrix = np.zeros((pp_size, pp_size))
@@ -771,13 +801,14 @@ class CDCPPScheduler:
             sys_cfg = SystemConfig(
                 T_F=T_F_list,
                 T_B=T_B_list,
-                T_C=new_latency_matrix,
+                T_alpha=new_latency_matrix,
                 T_beta=new_bandwidth_matrix,
                 T_W=T_W_list,
                 M_F=M_F_list,
                 M_B=M_B_list,
                 M_W=M_W_list,
                 M_Limit=M_Limit_list,
+                T_DP=T_DP_list,
                 num_devices=pp_size,
                 num_microbatches=self.num_microbatch,
                 num_chunks=self.pp_schedule.sys_config.num_chunks,
@@ -1179,10 +1210,7 @@ class CDCPPScheduler:
                         encoder_decoder_xattn=False,
                     )
                     self.total_num_tokens += num_tokens.item()
-                    # The following is buggy. crossdc: TODO: another way to deallocate?
-                    # if is_last_stage:
-                    #     # no need to cache output tensor at last stage
-                    #     self.output_tensors[(mb_id, chunk_id)] = None
+                    # crossdc: TODO: another way to deallocate?
                 else:
                     subpart_start = compute_task.task_desc.subpart_start
                     subpart_end = compute_task.task_desc.subpart_end
@@ -1229,7 +1257,8 @@ class CDCPPScheduler:
                 if self._is_last_microbatch_for_model_chunk(
                     compute_task, num_microbatches
                 ):
-                    self.enable_grad_sync()
+                    self.enable_grad_sync(chunk_id)
+                    self.cdc_print(f"enable_grad_sync for last microbatch, task: {mb_id}, chunk: {chunk_id}", verbose=2)
 
                 if not self.subblock_scheduling:                    
                     output_tensor_grad = (
@@ -1255,11 +1284,6 @@ class CDCPPScheduler:
                     if self.wgrad_store is not None:
                         self.wgrad_store.finish_collection_wgrad_block()
 
-                    # disable grad sync for other microbatches
-                    if self._is_last_microbatch_for_model_chunk(
-                        compute_task, num_microbatches
-                    ):
-                        self.disable_grad_sync()
                 else:
                     num_subparts = compute_task.task_desc.num_subparts
                     subpart_start = num_subparts - compute_task.task_desc.subpart_start - 1
@@ -1297,11 +1321,8 @@ class CDCPPScheduler:
                             if self.wgrad_store is not None:
                                 self.wgrad_store.finish_collection_wgrad_block()
 
-                    # disable grad sync for other microbatches
-                    if self._is_last_microbatch_for_model_chunk(
-                        compute_task, num_microbatches
-                    ):
-                        self.disable_grad_sync()
+                
+                self.disable_grad_sync(chunk_id)
 
         elif task_type == "W" and not forward_only:
             assert self.wgrad_store is not None
@@ -1321,11 +1342,8 @@ class CDCPPScheduler:
                     if self._is_last_microbatch_for_model_chunk(
                         compute_task, num_microbatches
                     ):
-                        # TODO: I guess enable_grad_sync would not enable DP comm here.
-                        # So, we need to do it manually.
                         model_chunk = model[chunk_id]
-                        assert hasattr(model_chunk, "finish_grad_sync")
-                        model_chunk.finish_grad_sync()
+                        model_chunk.start_grad_sync()
                 else:
                     num_subparts = compute_task.task_desc.num_subparts
                     subpart_start = compute_task.task_desc.subpart_start
@@ -1335,11 +1353,8 @@ class CDCPPScheduler:
                     if last_subpart and self._is_last_microbatch_for_model_chunk(
                         compute_task, num_microbatches
                     ):
-                        # TODO: I guess enable_grad_sync would not enable DP comm here.
-                        # So, we need to do it manually.
                         model_chunk = model[chunk_id]
-                        assert hasattr(model_chunk, "finish_grad_sync")
-                        model_chunk.finish_grad_sync()
+                        model_chunk.start_grad_sync()
 
 
         if self.exp_manager.profile_in_current_iter():
@@ -1396,32 +1411,28 @@ class CDCPPScheduler:
         # grad sync
         # Disable async grad reductions
         assert self.config is not None
-        self.no_sync_func = self.config.no_sync_func
-        # crossdc: chunk based no sync
-        if isinstance(self.no_sync_func, list):
+        assert self.config.no_sync_func is not None
+        if isinstance(self.config.no_sync_func, list):
+            self.no_sync_func = self.config.no_sync_func
+        else:
+            self.no_sync_func = [self.config.no_sync_func,]
+        
+        assert len(self.no_sync_func) == self.pp_schedule.sys_config.num_chunks
+        self.cdc_print(f"no_sync_func: {self.no_sync_func}", verbose=2)
+        
+        self.no_sync_context = [None] * self.pp_schedule.sys_config.num_chunks
 
-            def multi_no_sync():
-                stack = contextlib.ExitStack()
-                for model_chunk_no_sync_func in self.args.no_sync_func:
-                    stack.enter_context(model_chunk_no_sync_func())
-                return stack
-
-            self.no_sync_func = multi_no_sync
-        if self.no_sync_func is None:
-            self.no_sync_func = contextlib.nullcontext
-        self.no_sync_context = None
-
-    def disable_grad_sync(self):
+    def disable_grad_sync(self, chunk_id):
         """Disable asynchronous grad reductions"""
-        if self.no_sync_context is None:
-            no_sync_context = self.no_sync_func()
-            no_sync_context.__enter__()
+        if self.no_sync_context[chunk_id] is None:
+            self.no_sync_context[chunk_id] = self.no_sync_func[chunk_id]()
+            self.no_sync_context[chunk_id].__enter__()
 
-    def enable_grad_sync(self):
+    def enable_grad_sync(self, chunk_id):
         """Enable asynchronous grad reductions"""
-        if self.no_sync_context is not None:
-            self.no_sync_context.__exit__(None, None, None)
-            self.no_sync_context = None
+        if self.no_sync_context[chunk_id] is not None:
+            self.no_sync_context[chunk_id].__exit__(None, None, None)
+            self.no_sync_context[chunk_id] = None
 
     def forward_backward_func(
         self,
@@ -1517,7 +1528,9 @@ class CDCPPScheduler:
 
         self.setup_grad_sync()
 
-        self.disable_grad_sync()
+        for chunk_id in range(self.pp_schedule.sys_config.num_chunks):
+            self.disable_grad_sync(chunk_id)
+            assert not any(bucket_group.is_last_microbatch for bucket_group in model[chunk_id].bucket_groups)
 
         tensor_shape = [seq_length, micro_batch_size, config.hidden_size]
         tensor_shape[0] = (
@@ -1557,7 +1570,8 @@ class CDCPPScheduler:
 
         assert self.wgrad_store is None or self.wgrad_store.is_empty()
 
-        self.enable_grad_sync()
+        for chunk_id in range(self.pp_schedule.sys_config.num_chunks):
+            self.enable_grad_sync(chunk_id)
 
         if config.finalize_model_grads_func is not None and not forward_only:
             # If defer_embedding_wgrad_compute is enabled we need to do the
@@ -1573,6 +1587,8 @@ class CDCPPScheduler:
             )
 
         if self.exp_manager.profile_in_current_iter():
+            assert len(self.exp_manager.cdc_chunk_parameters) == self.pp_schedule.sys_config.num_chunks
+            self.exp_manager.cdc_dp_comm_profiles = self.dp_benchmark(self.exp_manager.cdc_chunk_parameters)
             # write profile result
             if self.exp_manager.cdc_log_profile:
                 self.cdc_print(
@@ -1586,6 +1602,7 @@ class CDCPPScheduler:
                 self.cdc_print(
                     f"cdc_chunk_parameters: {self.exp_manager.cdc_chunk_parameters}"
                 )
+                self.cdc_print(f"cdc_dp_comm_profiles: {self.exp_manager.cdc_dp_comm_profiles}")
                 self.cdc_print(f"cdc_layer_info: {self.exp_manager.cdc_layer_info}")
 
                 with open(self.exp_manager.profile_result_rank_file, "w") as f:
@@ -1595,6 +1612,7 @@ class CDCPPScheduler:
                                 self.exp_manager.cdc_compute_profile_dict
                             ),
                             "comm": self.exp_manager.cdc_comm_profiles,
+                            "dp_comm": self.exp_manager.cdc_dp_comm_profiles,
                             "base_mem": self.exp_manager.cdc_base_memory,
                             "params": self.exp_manager.cdc_chunk_parameters,
                             "layer_info": self.exp_manager.cdc_layer_info,
@@ -1605,6 +1623,7 @@ class CDCPPScheduler:
             dist.barrier()
 
             # rank 0 concludes the profile result
+            num_chunks = self.pp_schedule.sys_config.num_chunks
             if dist.get_rank() == 0:
                 json_file_path = self.exp_manager.profile_result_path
                 json_results = []
@@ -1614,14 +1633,15 @@ class CDCPPScheduler:
                         json_results.append(json.load(f))
 
                 # crossdc: TODO: rebalance based on profile, heterogeneity
-                T_F_list = []
-                T_B_list = []
-                T_W_list = []
-                T_C_matrix = np.zeros((pp_size, pp_size))
+                T_F_list = np.zeros((num_chunks, pp_size))
+                T_B_list = np.zeros((num_chunks, pp_size))
+                T_W_list = np.zeros((num_chunks, pp_size))
+                T_alpha_matrix = np.zeros((pp_size, pp_size))
                 T_bw_matrix = np.zeros((pp_size, pp_size))
-                M_F_list = []
-                M_B_list = []
-                M_W_list = []
+                T_DP_list = np.zeros((num_chunks, pp_size))
+                M_F_list = np.zeros((num_chunks, pp_size))
+                M_B_list = np.zeros((num_chunks, pp_size))
+                M_W_list = np.zeros((num_chunks, pp_size))
                 M_Limit_list = []
                 base_mem_list = []
                 max_gpu_mem = torch.cuda.get_device_properties(
@@ -1630,53 +1650,59 @@ class CDCPPScheduler:
                 for i in range(pp_size):
                     compute_profile = str_keys_to_tuple(json_results[i]["compute"])
                     base_mem_list.append(json_results[i]["base_mem"])
-                    T_cur_dev = [[] for _ in range(3)]
-                    M_cur_dev = [[] for _ in range(3)]
+                    T_cur_dev = [[[] for _ in range(num_chunks)] for _ in range(3)]
+                    M_cur_dev = [[[] for _ in range(num_chunks)] for _ in range(3)]
                     for key, value in compute_profile.items():
                         cur_mb, cur_chunk, cur_type = key
                         compute_time, mem_before, mem_after = value
-                        T_cur_dev[cur_type].append(compute_time)
-                        M_cur_dev[cur_type].append(mem_after - mem_before)
-                    # crossdc: TODO: currently we do not differentiate chunks in ppsim
-                    T_F_list.append(np.min(T_cur_dev[0]))
-                    T_B_list.append(np.min(T_cur_dev[1]))
-                    if len(T_cur_dev[2]) > 0:
-                        T_W_list.append(np.median(T_cur_dev[2])) # due to subblock scheduling, W time varies, some may close to 0.
-                    else:
-                        T_W_list.append(0)
-                    M_F_list.append(np.median(M_cur_dev[0]))
-                    if len(M_cur_dev[2]) > 0:
-                        M_W_list.append(np.median(M_cur_dev[2]))
-                    else:
-                        M_W_list.append(0)
-                    M_B_list.append(-M_F_list[-1] - M_W_list[-1])
+                        T_cur_dev[cur_type][cur_chunk].append(compute_time)
+                        M_cur_dev[cur_type][cur_chunk].append(mem_after - mem_before)
+                    for cur_chunk in range(num_chunks):
+                        T_F_list[cur_chunk][i] = np.min(T_cur_dev[0][cur_chunk])
+                        T_B_list[cur_chunk][i] = np.min(T_cur_dev[1][cur_chunk])
+                        if len(T_cur_dev[2][cur_chunk]) > 0:
+                            T_W_list[cur_chunk][i] = np.min(T_cur_dev[2][cur_chunk])
+                        else:
+                            T_W_list[cur_chunk][i] = 0
+                    for cur_chunk in range(num_chunks):
+                        M_F_list[cur_chunk][i] = np.median(M_cur_dev[0][cur_chunk])
+                        if len(M_cur_dev[2][cur_chunk]) > 0:
+                            M_W_list[cur_chunk][i] = np.median(M_cur_dev[2][cur_chunk])
+                        else:
+                            M_W_list[cur_chunk][i] = 0
+                        M_B_list[cur_chunk][i] = -M_F_list[cur_chunk][i] - M_W_list[cur_chunk][i]
+                        
                     M_Limit_list.append(int((max_gpu_mem - base_mem_list[-1]) * 0.98))
-                # T_C
+                # T_alpha
                 alpha_to_next, alpha_to_prev, beta_to_next, beta_to_prev = json_results[
                     0
                 ]["comm"]
                 message_size = self.pp_comm_size_bytes
                 for i in range(pp_size):
-                    T_C_matrix[i, (i + 1) % pp_size] = alpha_to_next[i]
+                    T_alpha_matrix[i, (i + 1) % pp_size] = alpha_to_next[i]
                     T_bw_matrix[i, (i + 1) % pp_size] = beta_to_next[i] * message_size
-                    T_C_matrix[i, (i - 1) % pp_size] = alpha_to_prev[i]
+                    T_alpha_matrix[i, (i - 1) % pp_size] = alpha_to_prev[i]
                     T_bw_matrix[i, (i - 1) % pp_size] = beta_to_prev[i] * message_size
 
-                # make T_C symmetric
-                T_C_matrix = (T_C_matrix + T_C_matrix.T) / 2
+                # make T_alpha symmetric
+                T_alpha_matrix = (T_alpha_matrix + T_alpha_matrix.T) / 2
                 # make T_bw symmetric
                 T_bw_matrix = (T_bw_matrix + T_bw_matrix.T) / 2
+                
+                # DP comm
+                T_DP_list = np.array(json_results[0]["dp_comm"])
                 with open(os.path.join(json_file_path, "total.json"), "w") as f:
                     json.dump(
                         {
-                            "T_F": T_F_list,
-                            "T_B": T_B_list,
-                            "T_W": T_W_list,
-                            "T_C": T_C_matrix.tolist(),
+                            "T_F": T_F_list.tolist(),
+                            "T_B": T_B_list.tolist(),
+                            "T_W": T_W_list.tolist(),
+                            "T_alpha": T_alpha_matrix.tolist(),
                             "T_bw": T_bw_matrix.tolist(),
-                            "M_F": M_F_list,
-                            "M_B": M_B_list,
-                            "M_W": M_W_list,
+                            "T_DP": T_DP_list.tolist(),
+                            "M_F": M_F_list.tolist(),
+                            "M_B": M_B_list.tolist(),
+                            "M_W": M_W_list.tolist(),
                             "M_Limit": M_Limit_list,
                             "M_base": base_mem_list,
                             "M_dev_max": max_gpu_mem,
@@ -2006,3 +2032,73 @@ class CDCPPScheduler:
             beta_to_next.tolist(),
             beta_to_prev.tolist(),
         )
+    
+    def dp_benchmark(self, chunk_params):
+        """
+        chunk_params: chunk_id -> num_params
+        
+        Return:
+            T_DP: (num_chunks, pp_size, 2) 3d list
+        """
+        dp_group = parallel_state.get_data_parallel_group()
+        dp_size = parallel_state.get_data_parallel_world_size()
+        pp_size = parallel_state.get_pipeline_model_parallel_world_size()
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+        if dp_size == 1:
+            return [[[0, 0] for _ in range(pp_size)] for _ in range(self.pp_schedule.sys_config.num_chunks)]
+        num_chunks = self.pp_schedule.sys_config.num_chunks
+        num_iters = 10
+        
+        T_DP_list = torch.zeros((num_chunks, pp_size, 2), dtype=torch.float32, device=torch.cuda.current_device())
+        
+        assert self.args.bf16
+        assert self.args.use_distributed_optimizer and self.args.overlap_param_gather and self.args.overlap_grad_reduce
+        assert len(chunk_params) == num_chunks
+        for chunk_id in range(num_chunks):
+            chunk_param = chunk_params[chunk_id] // dp_size * dp_size
+            param_dtype_size = 2 # bf16
+            grad_dtype_size = 4 if self.args.accumulate_allreduce_grads_in_fp32 else 2 # fp32 or bf16, see distributed_data_parallel.py
+            param_size = param_dtype_size * chunk_param
+            grad_size = grad_dtype_size * chunk_param
+            
+            threshold = 4 * 2**30 # 4GB
+
+            # param
+            test_size = threshold if param_size > threshold else param_size
+            temp_tensor = torch.randn(test_size // 2, dtype=torch.bfloat16, device=torch.cuda.current_device())
+            temp_tensor_shard = torch.randn(test_size // 2 // dp_size, dtype=torch.bfloat16, device=torch.cuda.current_device())
+            test_times = []
+            for _ in range(num_iters):
+                dist.barrier(group=dp_group)
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                dist.all_gather_into_tensor(temp_tensor, temp_tensor_shard, group=dp_group)
+                torch.cuda.synchronize()
+                end = time.perf_counter()
+                test_times.append(end - start)
+            T_DP_list[chunk_id][pp_rank][0] = np.median(test_times) * (param_size / test_size)
+            
+            # grad
+            test_size = threshold if grad_size > threshold else grad_size
+            temp_tensor = torch.randn(test_size // 2, dtype=torch.bfloat16, device=torch.cuda.current_device())
+            temp_tensor_shard = torch.randn(test_size // 2 // dp_size, dtype=torch.bfloat16, device=torch.cuda.current_device())
+            test_times = []
+            for _ in range(num_iters):
+                dist.barrier(group=dp_group)
+                torch.cuda.synchronize()
+                start = time.perf_counter()
+                dist.reduce_scatter_tensor(temp_tensor_shard, temp_tensor, group=dp_group)
+                torch.cuda.synchronize()
+                end = time.perf_counter()
+                test_times.append(end - start)
+            T_DP_list[chunk_id][pp_rank][1] = np.median(test_times) * (grad_size / test_size)
+        
+        dist.all_reduce(T_DP_list, op=dist.ReduceOp.AVG, group=dp_group)
+        dist.all_reduce(T_DP_list, op=dist.ReduceOp.SUM, group=pp_group)
+        
+        return T_DP_list.cpu().numpy().tolist()
+        
+
+def tolist_if_needed(x):
+    return x.tolist() if hasattr(x, 'tolist') else x

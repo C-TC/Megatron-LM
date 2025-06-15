@@ -30,27 +30,27 @@ class UDScheduleDevice:
         self.sys_cfg = sys_cfg
         self.num_devices = sys_cfg.num_devices
         self.num_subparts = num_subparts
-        self.T_F = sys_cfg.T_F[dev_id]
+        self.T_F = sys_cfg.T_F[0][dev_id]
         assert (
             self.T_F % num_subparts == 0
         ), f"{dev_id=}:{self.T_F=} must be divisible by {num_subparts=}"
-        self.T_B = sys_cfg.T_B[dev_id]
+        self.T_B = sys_cfg.T_B[0][dev_id]
         assert (
             self.T_B % num_subparts == 0
         ), f"{dev_id=}:{self.T_B=} must be divisible by {num_subparts=}"
-        self.T_W = sys_cfg.T_W[dev_id]
+        self.T_W = sys_cfg.T_W[0][dev_id]
         assert (
             self.T_W % num_subparts == 0
         ), f"{dev_id=}:{self.T_W=} must be divisible by {num_subparts=}"
-        self.M_F = sys_cfg.M_F[dev_id]
+        self.M_F = sys_cfg.M_F[0][dev_id]
         assert (
             self.M_F % num_subparts == 0
         ), f"{dev_id=}:{self.M_F=} must be divisible by {num_subparts=}"
-        self.M_B = sys_cfg.M_B[dev_id]
+        self.M_B = sys_cfg.M_B[0][dev_id]
         assert (
             self.M_B % num_subparts == 0
         ), f"{dev_id=}:{self.M_B=} must be divisible by {num_subparts=}"
-        self.M_W = sys_cfg.M_W[dev_id]
+        self.M_W = sys_cfg.M_W[0][dev_id]
         assert (
             self.M_W % num_subparts == 0
         ), f"{dev_id=}:{self.M_W=} must be divisible by {num_subparts=}"
@@ -69,7 +69,6 @@ class UDScheduleDevice:
         self.cur_mem_usage = 0
         self.last_scheduled_full_block_type = 0  # either F/B, by default, F block
 
-        # self.aux_w_if_b_mem_limited = sys_cfg.aux_w_if_b_mem_limited
         self.tear_down_phase = False
 
     def add_schedulable_node(self, node_list: List[UDSubScheduleNode]):
@@ -260,28 +259,28 @@ class DynZBUDSubScheduler:
         return self.system_cfg.num_chunks
 
     def get_T_F(self, device_id):
-        return self.system_cfg.T_F[device_id]
+        return self.system_cfg.T_F[0][device_id]
 
     def get_T_B(self, device_id):
-        return self.system_cfg.T_B[device_id]
+        return self.system_cfg.T_B[0][device_id]
 
     def get_T_W(self, device_id):
-        return self.system_cfg.T_W[device_id]
+        return self.system_cfg.T_W[0][device_id]
 
     def get_T_lat(self, src_dev, dst_dev):
-        return self.system_cfg.T_C[src_dev, dst_dev]
+        return self.system_cfg.T_alpha[src_dev, dst_dev]
 
     def get_T_bw(self, src_dev, dst_dev):
         return self.system_cfg.T_beta[src_dev, dst_dev]
 
     def get_M_F(self, device_id):
-        return self.system_cfg.M_F[device_id]
+        return self.system_cfg.M_F[0][device_id]
 
     def get_M_B(self, device_id):
-        return self.system_cfg.M_B[device_id]
+        return self.system_cfg.M_B[0][device_id]
 
     def get_M_W(self, device_id):
-        return self.system_cfg.M_W[device_id]
+        return self.system_cfg.M_W[0][device_id]
 
     def get_M_lim(self, device_id):
         return self.system_cfg.M_Limit[device_id]
@@ -411,7 +410,7 @@ class DynZBUDSubScheduler:
         self.merge_subparts()
 
     def merge_subparts(self):
-        # first: reorder patterns like 060606 (where 0 is W, 6 is F)
+        # first: reorder patterns like WFWFWF
         # by moving W to front, until end of a full block or another W
         for dev in self.devices:
             w_idx = 0

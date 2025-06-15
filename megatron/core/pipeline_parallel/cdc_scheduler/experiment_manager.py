@@ -30,6 +30,8 @@ class ExperimentManager:
         self.cdc_compute_profile_dict = {}
         # four lists of [alpha, beta] x [to_next, to_prev]
         self.cdc_comm_profiles = None
+        # DP comm: 3D list of (chunk, device, 2) -> time
+        self.cdc_dp_comm_profiles = None
         # basic memory: parameter, grad, optimizer state
         self.cdc_base_memory = -1
         # parameters in chunk

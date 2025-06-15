@@ -2,7 +2,6 @@ from typing import Callable, List, Optional, Tuple
 
 from .pipeline_config import PipelineBlockDesc, SystemConfig
 from .heuristic_ud_subschedule import DynZBUDSubScheduler
-from .heuristic_wave_subschedule import DynZBWaveSubScheduler
 from .pipeline import Pipeline, TaskNode
 from .util import BandwidthDelayModel
 
@@ -129,15 +128,16 @@ class SubPipeline(Pipeline):
     def _get_execution_time(self, task: SubTaskNode) -> int:
         ret = None
         task_type = task.task_type
+        chunk = task.chunk_id
         dev = task.device_id
         if task_type == "F":
-            ret = self.sys_config.T_F[dev]
+            ret = self.sys_config.T_F[chunk][dev]
         elif task_type == "B":
-            ret = self.sys_config.T_B[dev]
+            ret = self.sys_config.T_B[chunk][dev]
         else:
             # W block
-            assert self.sys_config.T_W[dev] > 0
-            ret = self.sys_config.T_W[dev]
+            assert self.sys_config.T_W[chunk][dev] > 0
+            ret = self.sys_config.T_W[chunk][dev]
 
         return ret // self.num_subparts * (task.subpart_end - task.subpart_start)
 
@@ -186,12 +186,8 @@ class SubPipeline(Pipeline):
                         lat_time = 0
                         bandwidth_time = 0
                     else:
-                        lat_time = self.sys_config.T_C[
-                            prev_microbatch_task_dev_id, cur_dev_id
-                        ]
-                        bandwidth_time = self.sys_config.T_beta[
-                            prev_microbatch_task_dev_id, cur_dev_id
-                        ]
+                        lat_time = self.sys_config.T_alpha[prev_microbatch_task_dev_id][cur_dev_id]
+                        bandwidth_time = self.sys_config.T_beta[prev_microbatch_task_dev_id][cur_dev_id]
 
                     if prev_device_task is not None:
                         cur_task.start_time = prev_device_task.completion_time
@@ -309,103 +305,3 @@ class DynZBUDSubPipeline(SubPipeline):
 
     def get_pipeline_last_stage_rank(self):
         return self.sys_config.num_devices - 1
-
-
-class DynZBWaveSubPipeline(SubPipeline):
-    def __init__(self, sys_config: SystemConfig, num_subparts: int = 1) -> None:
-        super().__init__(sys_config, num_subparts)
-        self.scheduler = DynZBWaveSubScheduler(sys_config, num_subparts)
-
-    def pipeline_name(self):
-        return "DynZBWaveSub"
-
-    def schedule(self) -> None:
-        self.scheduler.schedule()
-        schedule = self.scheduler.get_schedule()
-        num_dev = self.sys_config.num_devices
-
-        for dev in range(num_dev):
-            for i, subblock in enumerate(schedule[dev]):
-                self.device_scheduled_tasks[dev].append(
-                    SubTaskNode(
-                        task_type=subblock.task_type,
-                        device_id=dev,
-                        microbatch_id=subblock.mb_id,
-                        prev_device_task=self.device_scheduled_tasks[dev][-1]
-                        if i != 0
-                        else None,
-                        prev_microbatch_task=None,
-                        subpart_start=subblock.subpart_start,
-                        subpart_end=subblock.subpart_end,
-                        num_subparts=subblock.num_subparts,
-                        chunk_id=subblock.chunk_id,
-                        next_microbatch_task=None,
-                    )
-                )
-        self._resolve_batch_dependency()
-
-    def _get_microbatch_sequence(
-        self,
-    ) -> Tuple[List[Tuple[int, str]], Callable[[SubTaskNode, int, Tuple, int], bool]]:
-        num_dev = self.sys_config.num_devices
-        num_chunk = self.sys_config.num_chunks
-        sequence = []
-        for chunk in range(num_chunk):
-            if chunk % 2 == 0:
-                for dev in range(num_dev):
-                    sequence.append((dev, "F", chunk))
-            else:
-                for dev in reversed(range(num_dev)):
-                    sequence.append((dev, "F", chunk))
-
-        for chunk in reversed(range(num_chunk)):
-            if chunk % 2 == 0:
-                for dev in reversed(range(num_dev)):
-                    sequence.append((dev, "B", chunk))
-            else:
-                for dev in range(num_dev):
-                    sequence.append((dev, "B", chunk))
-
-        def condition(
-            task: SubTaskNode, mb: int, seq_element: Tuple[int, str], chunk_id: int
-        ):
-            return (
-                task.device_id == seq_element[0]
-                and task.task_type == seq_element[1]
-                and task.microbatch_id == mb
-                and task.chunk_id == chunk_id
-            )
-
-        return sequence, condition
-
-    def get_pipeline_first_stage_rank(self):
-        return 0
-
-    def get_pipeline_last_stage_rank(self):
-        return 0
-
-    def get_pipeline_execution_order(self) -> List[Tuple[int, int]]:
-        return [(dev, 0) for dev in range(self.sys_config.num_devices)] + [
-            (dev, 1) for dev in reversed(range(self.sys_config.num_devices))
-        ]
-
-
-    def is_send_to_next_rank(
-        self, prev_task: SubTaskNode, cur_task: SubTaskNode
-    ):
-        prev_dev = prev_task.device_id
-        cur_dev = cur_task.device_id
-        prev_type = prev_task.task_type
-        cur_type = cur_task.task_type
-        prev_chunk = prev_task.chunk_id
-        cur_chunk = cur_task.chunk_id
-        if prev_dev == cur_dev:
-            return 0
-        assert prev_type == cur_type
-        assert prev_chunk == cur_chunk
-        if prev_type == "F":
-            return 1 if prev_chunk % 2 == 0 else -1
-        elif prev_type == "B":
-            return 1 if prev_chunk % 2 == 1 else -1
-        else:
-            raise ValueError("Unreachable")

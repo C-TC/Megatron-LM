@@ -1508,6 +1508,7 @@ def _add_distributed_args(parser):
     group.add_argument('--enable_prefetch_opt', action='store_true', default=False, help='prefetch optimization for static schedule. Dynamic schedule has this opt by default')
     group.add_argument('--dynamic_schedule', type=str, default=None, choices=['wave', 'ud', 'subud'])
     group.add_argument('--dynamic_extra_mem_factor', type=float, default=0.0, help='Need profiling. Limit the memory to (1 + factor) * pp_size * chunks * M_F')
+    group.add_argument('--zero1_dp_modeling', action='store_true', default=False, help='Model the effect of DP comms in dynamic schedule')
     
     group.add_argument('--head_tail_as_one_layer', action='store_true', default=False, help='a hacky way to view vocabembedding and lm head as one layer')
     group.add_argument('--num_subparts', type=int, default=1, help='number of subparts in each chunk, must be enabled with subschedule and head_tail_as_one_layer')

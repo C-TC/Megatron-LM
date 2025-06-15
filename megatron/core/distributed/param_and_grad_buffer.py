@@ -312,12 +312,20 @@ class _ParamAndGradBucketGroup:
         assert (
             self.ddp_config.overlap_grad_reduce
         ), 'register_grad_ready() should only be called when overlap_grad_reduce is True'
+        from megatron.training import get_args
+        args = get_args()
+        if args.enable_cdcpp_scheduler:
+            from megatron.core.pipeline_parallel.cdc_scheduler.pp_scheduler import get_cdc_pp_scheduler
+            wgrad_split = get_cdc_pp_scheduler().wgrad_split
+        else:
+            wgrad_split = False
+        
         if self.is_last_microbatch:
             assert param in self.param_to_bucket, 'Param is not in the bucket group'
             assert param not in self.params_with_grad, 'Cannot set grad twice'
             self.params_with_grad.add(param)
             # If all params in bucket group have grads available, issue communication call.
-            if len(self.params_with_grad) == len(self.params):
+            if len(self.params_with_grad) == len(self.params) and not wgrad_split:
                 self.start_grad_sync()
 
 

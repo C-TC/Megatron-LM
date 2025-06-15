@@ -2,7 +2,6 @@ from typing import Type
 
 from .pipeline_config import SystemConfig
 from .auto_schedule import UnidirectionalZBDependencyGraph, WaveLikeZBDependencyGraph
-from .auto_schedule_store import AutoScheduleStore
 from .pipeline import (
     AutoZBUDPipeline,
     AutoWaveZBPipeline,
@@ -10,143 +9,16 @@ from .pipeline import (
     CPZBUDPipeline,
     CPZBWavePipeline,
     GpipePipeline,
-    Hanayo1F1BPipeline,
-    HeuristicWaveZBPipeline,
-    HeuristicWaveZBPipelineV2,
     HeuristicZBVPipeline,
-    HeuristicUDPipeline,
-    HeuristicZBUDPipeline,
     Interleaved1F1BPipeline,
     OneFOneBPipeline,
     Pipeline,
     ZBH1Pipeline,
 )
-from .subpipeline import DynZBUDSubPipeline, DynZBWaveSubPipeline
-from .simulator import BFSPPSimCfgGen, SimCfgGen
+from .subpipeline import DynZBUDSubPipeline
 from .util import generate_comm_mat
 from megatron.core.pipeline_parallel.cdc_scheduler.execution_planner import ExecutionPlanner
 
-
-
-def test_schedule_store():
-    ud_sys_cfg = SystemConfig(
-        num_devices=4,
-        num_microbatches=8,
-        T_F=200,
-        T_B=200,
-        T_W=200,
-        T_C=generate_comm_mat(2, 2, 0, 100),
-        M_F=4,
-        M_B=-2,
-        M_W=-2,
-        M_Limit=800,
-    )
-    wave_sys_cfg = SystemConfig(
-        num_devices=4,
-        num_microbatches=8,
-        num_chunks=2,
-        T_F=100,
-        T_B=100,
-        T_W=100,
-        T_C=generate_comm_mat(2, 2, 0, 100),
-        M_F=2,
-        M_B=-1,
-        M_W=-1,
-        M_Limit=800,
-    )
-
-    with AutoScheduleStore("ud_store.pkl", "wave_store.pkl") as store:
-        ud_schedule = store.get_ud_schedule_result(ud_sys_cfg).schedule
-        wave_schedule = store.get_wave_schedule_result(wave_sys_cfg).schedule
-
-
-def test_bfs_simulator():
-    sim = BFSPPSimCfgGen(
-        llama_model_size=405,
-        seq_len=8196,
-        mbs=1,
-        tp=8,
-        pp=8,
-        dp=64,
-        num_chunks=4,
-        gpu_mem_bytes=88 * 1024**3,  # around 96GB
-        gpu_avg_perf_flops=350 * 10**12,
-        num_DC=2,
-        DC_comm_latency=0.01,
-        DC_comm_bandwidth=8 * 10**9,
-        DC_intra_comm_bandwidth=160 * 10**9,
-        num_layers=128,
-        layer_recompute=True,
-    )
-    print(f"Simulated MILP BFSPP runtime: {sim.get_milp_sol_runtime()}")
-    print(f"Equation estimated BFSPP runtime: {sim.get_simulated_runtime()}")
-    print(f"Total computation time: {sim.get_total_computation_time_per_device()}")
-
-
-def test_simulator():
-    sim = SimCfgGen(
-        llama_model_size=405,
-        seq_len=8196,
-        mbs=1,
-        tp=8,
-        pp=8,
-        dp=64,
-        num_mb_per_pp_stage=2,
-        num_chunks=1,
-        gpu_mem_bytes=88 * 1024**3,  # around 96GB
-        gpu_avg_perf_flops=350 * 10**12,
-        num_DC=2,
-        DC_comm_latency=0.01,
-        DC_comm_bandwidth=32 * 10**9,
-        num_layers=128,
-    )
-
-    sys_config = sim.get_system_config()
-    print(sys_config)
-    sim.print_stats()
-    dg = UnidirectionalZBDependencyGraph(sys_config)
-    dg.build_ilp()
-    dg.solve_ilp(time_limit=20, warm_start=False)
-    schedule = dg.get_schedule()
-
-    azb = AutoZBUDPipeline(sys_config)
-    azb.schedule(schedule)
-    azb.solve_dependencies()
-    azb.print_debug_schedule(verbose=1)
-    azb.print_schedule()
-
-
-def test_simulator_wave():
-    sim = SimCfgGen(
-        llama_model_size=405,
-        seq_len=8196,
-        mbs=1,
-        tp=8,
-        pp=4,
-        dp=64,
-        num_mb_per_pp_stage=4,
-        num_chunks=2,
-        gpu_mem_bytes=88 * 1024**3,  # around 96GB
-        gpu_avg_perf_flops=350 * 10**12,
-        num_DC=2,
-        DC_comm_latency=0.01,
-        DC_comm_bandwidth=32 * 10**9,
-        num_layers=128,
-    )
-
-    sys_config = sim.get_system_config()
-    print(sys_config)
-    sim.print_stats()
-    dg = WaveLikeZBDependencyGraph(sys_config)
-    dg.build_ilp()
-    dg.solve_ilp(time_limit=20, warm_start=False)
-    schedule = dg.get_schedule()
-
-    azb = AutoWaveZBPipeline(sys_config)
-    azb.schedule(schedule)
-    azb.solve_dependencies()
-    azb.print_debug_schedule(verbose=1)
-    azb.print_schedule()
 
 
 def test_pipeline(
@@ -221,66 +93,8 @@ def test_basic_schedule():
     test_pipeline(OneFOneBPipeline, sys_config, 6600)
     test_pipeline(GpipePipeline, sys_config, 6600)
     test_pipeline(Interleaved1F1BPipeline, interleaved_sys_config, 5700)
-    test_pipeline(Hanayo1F1BPipeline, interleaved_sys_config, 6500)
     test_pipeline(ZBH1Pipeline, zbh1_sys_config, 5400)
-    test_pipeline(HeuristicWaveZBPipeline, heur_zbv_sys_config, 5100)
     test_pipeline(HeuristicZBVPipeline, heur_zbv_sys_config)
-    test_pipeline(HeuristicWaveZBPipelineV2, heur_zbv_sys_config)
-
-def test_heuristic_zb_v2():    
-    sys_config = SystemConfig(
-        num_devices=4,
-        num_microbatches=8,
-        T_F=200,
-        T_B=200,
-        T_W=200,
-        T_C=generate_comm_mat(1, 4, 5, 0),
-        num_chunks=2,
-        M_F=2,
-        M_B=-1,
-        M_W=-1,
-        M_Limit=16,
-    )
-    pp = HeuristicWaveZBPipelineV2(sys_config)
-    pp.schedule()
-    pp.solve_dependencies()
-    pp.print_schedule(save=True)
-
-def test_heuristic_ud():
-    ud_cfg = SystemConfig(
-        num_devices=4,
-        num_microbatches=8,
-        T_F=200,
-        T_B=400,
-        T_W=0,
-        T_C=generate_comm_mat(2, 2, 0, 800),
-        M_F=2,
-        M_B=-2,
-        M_W=0,
-        M_Limit=8)
-    
-    
-    udzb_cfg = SystemConfig(
-        num_devices=4,
-        num_microbatches=8,
-        T_F=200,
-        T_B=200,
-        T_W=200,
-        T_C=generate_comm_mat(2, 2, 0, 800),
-        M_F=2,
-        M_B=-1,
-        M_W=-1,
-        M_Limit=8,
-    )
-    udpp = HeuristicUDPipeline(ud_cfg)
-    udpp.schedule()
-    udpp.solve_dependencies()
-    udpp.print_schedule(save=True)
-    udzbpp = HeuristicZBUDPipeline(udzb_cfg)
-    udzbpp.schedule()
-    udzbpp.solve_dependencies()
-    udzbpp.print_schedule(save=True)
-
 
 def test_execution_planner_0():
     sys_config = SystemConfig(
@@ -513,37 +327,6 @@ def test_subpipe_ud_recomp():
     planner = ExecutionPlanner(pp)
     planner.generate_execution_plan()
 
-
-def test_subpipe_wave():   
-    num_dev = 16
-    num_parts = 2
-    num_chunks = 2
-    sys_config = SystemConfig(
-        num_devices=num_dev,
-        num_microbatches=2*num_dev,
-        T_F=20 * num_parts,
-        T_B=25 * num_parts,
-        T_W=17 * num_parts,
-        T_C=generate_comm_mat(2, num_dev // 2, 0, 30 * num_parts),
-        T_beta=generate_comm_mat(2, num_dev // 2, 0, 0 * num_parts),
-        M_F=20 * num_parts,
-        M_B=-1 * num_parts,
-        M_W=-19 * num_parts,
-        M_Limit=20*num_chunks*num_parts*num_dev,
-        num_chunks=2,
-    )
-    example_pp = HeuristicZBVPipeline(sys_config)
-    example_pp.schedule()
-    example_pp.solve_dependencies()
-    # print(f'Baseline: Runtime: {example_pp.get_schedule_time(device_wise=True) / num_parts}')
-    example_pp.print_schedule(save=True)
-    pp = DynZBWaveSubPipeline(sys_config, num_subparts=num_parts)
-    pp.schedule()
-    # pp.print_debug_schedule(verbose=0)
-    pp.solve_dependencies()
-    print(f'Runtime: {pp.get_schedule_time(device_wise=True) / num_parts / num_chunks}, Bubble: {pp.get_bubble_ratio(device_wise=True)}')
-    pp.print_schedule(save=True, include_info=num_dev <= 8)
-    
 
 if __name__ == "__main__":
     test_basic_schedule()
